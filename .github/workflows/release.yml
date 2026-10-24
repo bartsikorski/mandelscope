@@ -1,0 +1,53 @@
+name: Release
+
+# Push a tag like v1.0.0 to build the Windows program and attach it to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: uv sync
+
+      - name: Build Mandelscope.exe
+        run: uv run --with "pyinstaller>=6.10" pyinstaller packaging/mandelscope.spec --noconfirm --clean --distpath dist --workpath build
+
+      - name: CPU mode (Mesa llvmpipe from github.com/mmozeiko/build-mesa)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          uv run python -m mandelscope get-mesa --dest dist/Mandelscope/software
+          curl.exe -fsSL --retry 3 -o dist/Mandelscope/software/MESA-LICENSE.rst https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/docs/license.rst
+          curl.exe -fsSL --retry 3 -o dist/Mandelscope/software/LLVM-LICENSE.txt https://raw.githubusercontent.com/llvm/llvm-project/main/llvm/LICENSE.TXT
+
+      - name: Check the program starts in CPU mode
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist/Mandelscope/mandelscope-cli.exe -ArgumentList "--software", "info" -NoNewWindow -Wait -PassThru -RedirectStandardOutput info.txt
+          Get-Content info.txt
+          if ($p.ExitCode -ne 0 -or -not (Select-String -Path info.txt -Pattern "llvmpipe" -Quiet)) { exit 1 }
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md, CREDITS.md, README.md, CHANGELOG.md dist/Mandelscope/
+          Compress-Archive -Path dist/Mandelscope -DestinationPath "Mandelscope-${{ github.ref_name }}-windows-x64.zip"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: Mandelscope-*-windows-x64.zip
+          generate_release_notes: true

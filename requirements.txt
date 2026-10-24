@@ -1,0 +1,9 @@
+# Fallback for plain pip / venv users (uv users: `uv sync` uses pyproject.toml + uv.lock)
+numpy>=1.26
+moderngl>=5.10
+glcontext>=3.0
+imgui-bundle>=1.92.5
+gmpy2>=2.2
+pillow>=10.0
+imageio-ffmpeg>=0.5
+pytest>=8

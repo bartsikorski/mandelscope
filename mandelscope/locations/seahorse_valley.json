@@ -1,0 +1,10 @@
+{
+ "title": "Seahorse valley",
+ "view": {
+  "re": "-0.7453",
+  "im": "0.1127",
+  "log2r": -7.265344566520995,
+  "angle": 0.0,
+  "max_iter": 2000
+ }
+}

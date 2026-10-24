@@ -1,0 +1,10 @@
+{
+ "title": "Elephant valley",
+ "view": {
+  "re": "0.2925",
+  "im": "0.0155",
+  "log2r": -7.795859283219775,
+  "angle": 0.0,
+  "max_iter": 3000
+ }
+}

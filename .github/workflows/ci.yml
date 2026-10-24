@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Software OpenGL (Mesa llvmpipe, OpenGL 4.5) on a virtual display: the GPU tests, the
+    # MPFR ground-truth comparisons and the scripted GUI session all run without a graphics card.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages (Mesa, Xvfb, libraries GLFW loads)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgl1 libegl1 libgl1-mesa-dri libglx-mesa0 \
+            libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 libxxf86vm1 libxkbcommon0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: uv sync --all-extras
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Tests
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a -s "-screen 0 1400x900x24" uv run pytest -q
+
+  windows:
+    # The Windows program in CPU mode: Mesa llvmpipe (github.com/mmozeiko/build-mesa, the same
+    # files the release zip carries), so this runner needs no graphics card either.  Checks the
+    # download, the DLL loading before GLFW / Dear ImGui / moderngl, the engine and the GUI.
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: uv sync --all-extras
+
+      - name: Mesa (software OpenGL)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: uv run python -m mandelscope get-mesa
+
+      - name: CPU mode
+        run: uv run python -m mandelscope --software info
+
+      - name: Tests (CPU mode)
+        env:
+          MANDELSCOPE_SOFTWARE: "1"
+        run: uv run pytest -q -m "not gui"
+
+      - name: Scripted GUI session (CPU mode)
+        env:
+          MANDELSCOPE_SOFTWARE: "1"
+        run: uv run pytest -q -m gui

@@ -1,0 +1,68 @@
+[project]
+name = "mandelscope"
+version = "1.0.0"
+description = "GPU deep-zoom explorer of the Mandelbrot set, its Julia sets and the Burning Ship: perturbation, rebasing and second-order BLA on OpenGL compute shaders; live exploration, colour looks, keyframe videos, CPU mode, game controllers"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "CREDITS.md"]
+authors = [{ name = "Mandelscope contributors" }]
+keywords = ["mandelbrot", "fractal", "deep zoom", "perturbation", "gpu", "opengl", "julia set", "burning ship", "gamepad"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "numpy>=1.26",
+    "moderngl>=5.10",
+    "glcontext>=3.0",
+    "imgui-bundle>=1.92.5",
+    "gmpy2>=2.2",
+    "pillow>=10.0",
+    "imageio-ffmpeg>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/bartsikorski/mandelscope"
+Releases = "https://github.com/bartsikorski/mandelscope/releases"
+Issues = "https://github.com/bartsikorski/mandelscope/issues"
+Changelog = "https://github.com/bartsikorski/mandelscope/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+mandelscope = "mandelscope.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mandelscope"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs an OpenGL 4.3 context",
+    "slow: long running",
+    "gui: needs a display (or Xvfb)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E9"]          # pyflakes + syntax errors (CI); style is not enforced

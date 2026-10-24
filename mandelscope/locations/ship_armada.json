@@ -1,0 +1,11 @@
+{
+ "title": "The armada",
+ "formula": "ship",
+ "view": {
+  "re": "-1.7615",
+  "im": "0.0290",
+  "log2r": -4.878321443411748,
+  "angle": 0.0,
+  "max_iter": 3000
+ }
+}

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+selftest_out/
+footage/
+build/
+dist/
+*.mp4
+*.png
+!mandelscope/**/*.png
+!docs/**/*.png
+Mandelscope.lnk
+software/

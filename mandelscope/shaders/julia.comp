@@ -1,0 +1,217 @@
+// Julia sets z -> z^2 + c (c fixed, z0 = the sample's point), direct iteration.
+//
+// Same buffers, scheduling protocol and result format as perturb.comp, so fields, the
+// progressive order, pending lists, reuse (pan / zoom remaps), colouring and anti-aliasing
+// work unchanged.  Depth is limited by the precision of z (float32 or float64): about 10^3
+// (float32) or 10^11 (float64) times the size of the whole set.
+//
+// Variants (prepended #defines): USE_DOUBLE, WITH_DE, WITH_INTERIOR, WITH_STRIPES.
+//   WITH_DE / WITH_INTERIOR both use dz/dz0: the distance estimate, and inside the filled
+//   Julia set (attracted by a cycle) dz/dz0 -> 0.
+
+layout(local_size_x = 64) in;
+
+#ifdef USE_DOUBLE
+  #define R double
+  #define R2 dvec2
+#else
+  #define R float
+  #define R2 vec2
+#endif
+
+const int EXP_ZERO = -1048576;
+const uint ST_NEW = 0u;
+const uint ST_RUN = 1u;
+const uint ST_DONE = 2u;
+const uint RES_MAXITER = 0xFFFFFFFFu;
+const uint RES_INTERIOR = 0xFFFFFFFEu;
+
+struct Pix {           // layout identical to perturb.comp (same buffer stride / status word)
+    R2 w;              // z
+    vec2 Dm;           // dz/dz0 mantissa
+    vec2 Em;           // (unused)
+    int k;
+    int De;            // dz/dz0 exponent
+    int Ee;
+    uint m;
+    uint n;            // iteration count
+    uint status;
+    float sAvg;
+    float sPrev;
+};
+
+struct Result {
+    uint n;
+    float frac;
+    float de;
+    float ang;
+    float zarg;
+    float stripe;
+    float r0;
+    float r1;
+};
+
+layout(std430, binding = 0) buffer StateBuf  { Pix state[]; };
+layout(std430, binding = 1) buffer ResultBuf { Result res[]; };
+layout(std430, binding = 6) readonly buffer OrderBuf { uint order[]; };
+layout(std430, binding = 7) readonly buffer PendIn { uint pendIn[]; };
+layout(std430, binding = 8) writeonly buffer PendOut { uint pendOut[]; };
+layout(std430, binding = 9) buffer Counters {
+    uint pendCount;
+    uint doneCount;
+    uint minIter;
+    uint maxIter;
+    uint stepsLo;
+    uint stepsHi;
+    uint blaSkips;
+    uint rebases;
+    uint maxIterCount;
+    uint interiorCount;
+};
+
+uniform uvec2 uField;
+uniform ivec2 uTileOrigin;
+uniform vec2  uImgHalf;
+uniform vec2  uRot;
+uniform uint  uMaxIter;
+uniform uint  uBudget;
+uniform float uBail2;
+uniform uint  uMode;
+uniform uint  uStart;
+uniform uint  uCount;
+uniform vec2  uJitter;
+uniform int   uInteriorExp;
+uniform float uStripeFreq;
+uniform float uStripeDecay;
+uniform R2    uJC;           // c
+uniform R2    uJCentre;      // view centre (z plane)
+uniform R     uJH;           // sample spacing
+uniform float uJLog2H;       // log2 of the sample spacing
+
+float pow2f(int e) {
+    if (e < -126) return 0.0;
+    return intBitsToFloat((min(e, 127) + 127) << 23);
+}
+vec2 scale2f(vec2 x, int e) {
+    if (e < -280) return vec2(0.0);
+    int e1 = e / 2;
+    return x * (pow2f(e1) * pow2f(e - e1));
+}
+int expf(float x) {
+    return ((floatBitsToInt(x) >> 23) & 0xFF) - 126;
+}
+vec2 cmulf(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+
+void finish(uint idx, inout Pix s, uint nres, float frac, float de, float ang, float zarg, float stripe) {
+    s.status = ST_DONE;
+    res[idx] = Result(nres, frac, de, ang, zarg, stripe, 0.0, 0.0);
+    atomicAdd(doneCount, 1u);
+    if (nres < RES_INTERIOR) {
+        atomicMin(minIter, nres);
+        atomicMax(maxIter, nres);
+    } else if (nres == RES_MAXITER) {
+        atomicAdd(maxIterCount, 1u);
+    } else {
+        atomicAdd(interiorCount, 1u);
+    }
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uCount) return;
+    uint idx = (uMode == 0u) ? order[uStart + gid] : pendIn[uStart + gid];
+    Pix s = state[idx];
+    if (s.status == ST_DONE) return;
+    if (s.status == ST_NEW) {
+        uint sx = idx % uField.x;
+        uint sy = idx / uField.x;
+        vec2 q = vec2(float(int(sx) + uTileOrigin.x) + 0.5 + uJitter.x - uImgHalf.x,
+                      -(float(int(sy) + uTileOrigin.y) + 0.5 + uJitter.y - uImgHalf.y));
+        vec2 qr = vec2(uRot.x * q.x - uRot.y * q.y, uRot.y * q.x + uRot.x * q.y);
+        s.w = uJCentre + R2(qr) * uJH;
+        s.n = 0u;
+        s.Dm = vec2(1.0, 0.0); s.De = 0;
+        s.sAvg = 0.0; s.sPrev = 0.0;
+        s.status = ST_RUN;
+    }
+    R2 z = s.w;
+    R2 c = uJC;
+    float log2B = 0.5 * log2(uBail2);
+    uint steps = 0u;
+    bool done = false;
+    while (true) {
+        R r2 = dot(z, z);
+        if (r2 > R(uBail2)) {
+            vec2 zf = vec2(z);
+            float lr2 = log2(float(r2));
+            float frac = 1.0 - log2(0.5 * lr2 / log2B);
+            float de = 0.0, ang = 0.0;
+#ifdef WITH_DE
+            float l2D = float(s.De) + 0.5 * log2(dot(s.Dm, s.Dm));
+            float l2z = 0.5 * lr2;
+            float l2de = l2z + log2(l2z * 0.6931471805599453) - l2D - uJLog2H;
+            de = exp2(clamp(l2de, -120.0, 120.0));
+            vec2 u = cmulf(zf, vec2(s.Dm.x, -s.Dm.y));
+            ang = atan(u.y, u.x);
+#endif
+            float zarg = atan(zf.y, zf.x);
+            float stripe = 0.0;
+#ifdef WITH_STRIPES
+            {
+                float fz = 0.5 + 0.5 * sin(uStripeFreq * zarg);
+                float cur = mix(s.sAvg, fz, uStripeDecay);
+                stripe = mix(s.sAvg, cur, clamp(frac, 0.0, 1.0));
+            }
+#endif
+            finish(idx, s, max(s.n, 1u), frac, de, ang, zarg, stripe);
+            done = true;
+            break;
+        }
+#if defined(WITH_INTERIOR)
+        {
+            float me0 = max(abs(s.Dm.x), abs(s.Dm.y));
+            if (s.n > 0u && (me0 == 0.0 || s.De + expf(me0) < uInteriorExp)) {
+                finish(idx, s, RES_INTERIOR, float(s.n), 0.0, 0.0, 0.0, 0.0);   // frac: detected at iteration n
+                done = true;
+                break;
+            }
+        }
+#endif
+        if (s.n >= uMaxIter) {
+            finish(idx, s, RES_MAXITER, 0.0, 0.0, 0.0, 0.0, 0.0);
+            done = true;
+            break;
+        }
+        if (steps >= uBudget) break;
+        steps++;
+#ifdef WITH_STRIPES
+        if (s.n > 0u) {
+            vec2 zz = vec2(z);
+            float fz = 0.5 + 0.5 * sin(uStripeFreq * atan(zz.y, zz.x));
+            s.sPrev = s.sAvg;
+            s.sAvg = mix(s.sAvg, fz, uStripeDecay);
+        }
+#endif
+#if defined(WITH_DE) || defined(WITH_INTERIOR)
+        s.Dm = 2.0 * cmulf(vec2(z), s.Dm);
+        float md = max(abs(s.Dm.x), abs(s.Dm.y));
+        if (md != 0.0) {
+            int ed = expf(md);
+            if (ed > 40 || ed < -40) { s.Dm = scale2f(s.Dm, -ed); s.De += ed; }
+        } else {
+            s.De = -100000;           // exactly zero derivative: super-attracting
+            s.Dm = vec2(1.0, 0.0);
+        }
+#endif
+        z = R2(z.x * z.x - z.y * z.y, R(2.0) * z.x * z.y) + c;
+        s.n += 1u;
+    }
+    s.w = z;
+    state[idx] = s;
+    if (!done) {
+        uint p = atomicAdd(pendCount, 1u);
+        pendOut[p] = idx;
+    }
+    uint old = atomicAdd(stepsLo, steps);
+    if (old + steps < old) atomicAdd(stepsHi, 1u);
+}

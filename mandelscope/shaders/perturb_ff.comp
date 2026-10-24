@@ -1,0 +1,665 @@
+// Perturbation + rebasing + BLA iteration, "precise" mode in float-float arithmetic.
+//
+// The same algorithm as perturb.comp (read that first), with every delta mantissa held as an
+// unevaluated sum of two floats (hi + lo, about 48 bits) instead of a float64: graphics cards
+// for games run float64 at 1/16 to 1/64 of the float32 rate, while float-float needs only
+// float32 instructions.  The exponent is kept separately as in the other modes (w * 2^k), so
+// the number type is "2 x 32 bits + exponent" - the idea of FractalShark's precise types
+// (github.com/mattsaccount364/FractalShark); the error-free sums and products are the classic
+// ones of T. J. Dekker (1971) and D. E. Knuth (TAOCP vol. 2).  The Burning Ship is not
+// available in this mode (the explorer uses float64 for it).
+//
+// Number layout: a real is vec2(hi, lo); a complex is vec4(re.hi, im.hi, re.lo, im.lo), so
+// .xy is the float approximation.  Derivatives, radii and tests stay float32 (they need no
+// more), as in the float64 mode.
+//
+// Variants (prepended #defines): WITH_DE, WITH_INTERIOR, WITH_STRIPES, RUN_LENGTH, FF_FMA (the
+// GPU's fma rounds once: exact products in 2 instructions instead of Dekker's 17).
+
+layout(local_size_x = 64) in;
+
+const int RB = 30;
+const int SMALL_EXP = -60;
+const int FAST_OFF = 30;
+#define W_LO (1.0 / 2147483648.0)                    /* 2^-(RB+1) */
+#define W_HI (1.0e18)
+
+const int EXP_ZERO = -1048576;
+const uint ST_NEW = 0u;
+const uint ST_RUN = 1u;
+const uint ST_DONE = 2u;
+const uint RES_MAXITER = 0xFFFFFFFFu;
+const uint RES_INTERIOR = 0xFFFFFFFEu;
+
+struct Pix {           // (same size and word layout as the float64 Pix)
+    vec4 w;            // rescaled delta mantissa (complex float-float)
+    vec2 Dm;
+    vec2 Em;
+    int k;
+    int De;
+    int Ee;
+    uint m;
+    uint n;
+    uint status;
+    float sAvg;
+    float sPrev;
+};
+
+struct Result {
+    uint n;
+    float frac;
+    float de;
+    float ang;
+    float zarg;
+    float stripe;
+    float r0;
+    float r1;
+};
+
+struct RefQ {          // reference value: z = (X.hi, Y.hi, X.lo, Y.lo); aux.x = "tiny" flag
+    vec4 z;
+    vec4 aux;
+};
+
+struct BLA {
+    vec4 Am;
+    vec4 Bm;
+    int Ae;
+    int Be;
+    float logR;
+    float pad;
+};
+
+layout(std430, binding = 0) buffer StateBuf  { Pix state[]; };
+layout(std430, binding = 1) buffer ResultBuf { Result res[]; };
+layout(std430, binding = 2) readonly buffer RefF { RefQ refF[]; };
+layout(std430, binding = 3) readonly buffer RefM { vec4 refM[]; };
+layout(std430, binding = 4) readonly buffer RefE { int refE[]; };
+layout(std430, binding = 5) readonly buffer BlaBuf { BLA bla[]; };
+struct BLAQ {
+    vec4 Cm;
+    vec4 Dm;
+    vec4 Em;
+    int Ce;
+    int De;
+    int Ee;
+    int pad;
+};
+layout(std430, binding = 10) readonly buffer BlaQBuf { BLAQ blaq[]; };
+layout(std430, binding = 6) readonly buffer OrderBuf { uint order[]; };
+layout(std430, binding = 7) readonly buffer PendIn { uint pendIn[]; };
+layout(std430, binding = 8) writeonly buffer PendOut { uint pendOut[]; };
+layout(std430, binding = 9) buffer Counters {
+    uint pendCount;
+    uint doneCount;
+    uint minIter;
+    uint maxIter;
+    uint stepsLo;
+    uint stepsHi;
+    uint blaSkips;
+    uint rebases;
+    uint maxIterCount;
+    uint interiorCount;
+    uint blaFails;
+};
+
+uniform uvec2 uField;
+uniform ivec2 uTileOrigin;
+uniform vec2  uImgHalf;
+uniform vec4  uOff;          // (centre - C_ref) / h, complex float-float
+uniform vec2  uRot;
+uniform vec2  uHm;           // h = uHm * 2^uHe, float-float
+uniform int   uHe;
+uniform uint  uMaxIter;
+uniform uint  uBudget;
+uniform float uBail2;
+uniform uint  uRefLen;
+uniform uint  uJulia;
+uniform uint  uBaseB;
+uniform uint  uLenA;
+uniform uint  uLenB;
+uniform uint  uPerA;         // period of a periodic reference (0: none): its cycle is stored once,
+uniform uint  uPerB;         // and an index past the end wraps back by the period
+uniform int   uLevelsA;
+uniform uint  uLevOffA[32];
+uniform uint  uLevCntA[32];
+uniform float uBlaMaxLogRA;
+uniform float uDOne;
+uniform int   uLev0;
+uniform int   uLevels;
+uniform uint  uLevOff[32];
+uniform uint  uLevCnt[32];
+uniform uint  uMode;
+uniform uint  uStart;
+uniform uint  uCount;
+uniform uint  uUseBla;
+uniform float uBlaMaxLogR;
+uniform uint  uBlaOrder;
+uniform uint  uBlaFast;
+uniform uint  uBlaBackoff;
+uniform uint  uBlaPrefilter;
+uniform uint  uRun;
+uniform float uLog2InteriorThr;
+uniform vec2  uJitter;
+uniform int   uInteriorExp;
+uniform float uStripeFreq;
+uniform float uStripeDecay;
+
+// ---------------------------------------------------------------- helpers
+bool gOnB = true;
+uint refBase() { return gOnB ? uBaseB : 0u; }
+uint refLen() { return gOnB ? uLenB : uLenA; }
+uint refPer() { return gOnB ? uPerB : uPerA; }
+uint wrapm(uint m) { return (m >= refLen() && refPer() != 0u) ? m - refPer() : m; }
+int blaLevels() { return gOnB ? uLevels : uLevelsA; }
+uint levOff(int j) { return gOnB ? uLevOff[j] : uLevOffA[j]; }
+uint levCnt(int j) { return gOnB ? uLevCnt[j] : uLevCntA[j]; }
+float blaMaxLogR() { return gOnB ? uBlaMaxLogR : uBlaMaxLogRA; }
+
+float pow2f(int e) {
+    if (e < -126) return 0.0;
+    return intBitsToFloat((min(e, 127) + 127) << 23);
+}
+vec2 scale2f(vec2 x, int e) {
+    if (e < -280) return vec2(0.0);
+    int e1 = e / 2;
+    return (x * pow2f(e1)) * pow2f(e - e1);
+}
+vec4 scale4(vec4 x, int e) {      // exact (both parts scale), unless a part leaves the float range
+    if (e < -280) return vec4(0.0);
+    int e1 = e / 2;
+    return (x * pow2f(e1)) * pow2f(e - e1);
+}
+int expf(float x) {
+    return ((floatBitsToInt(x) >> 23) & 0xFF) - 126;
+}
+vec2 cmulf(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+
+// ---------------------------------------------------------------- float-float
+// error-free transforms (Dekker 1971, Knuth): `precise` keeps the compiler from rewriting them
+vec2 quick_two_sum(float a, float b) {        // |a| >= |b|
+    precise float s = a + b;
+    precise float e = b - (s - a);
+    return vec2(s, e);
+}
+vec2 two_sum(float a, float b) {
+    precise float s = a + b;
+    precise float v = s - a;
+    precise float e = (a - (s - v)) + (b - v);
+    return vec2(s, e);
+}
+#ifdef FF_FMA
+vec2 two_prod(float a, float b) {             // (fma is one rounding on this GPU: tested at start)
+    precise float p = a * b;
+    precise float e = fma(a, b, -p);
+    return vec2(p, e);
+}
+#else
+vec2 split(float a) {                         // Dekker: 12 + 12 bits
+    precise float t = 4097.0 * a;
+    precise float hi = t - (t - a);
+    precise float lo = a - hi;
+    return vec2(hi, lo);
+}
+vec2 two_prod(float a, float b) {
+    precise float p = a * b;
+    vec2 x = split(a);
+    vec2 y = split(b);
+    precise float e = ((x.x * y.x - p) + x.x * y.y + x.y * y.x) + x.y * y.y;
+    return vec2(p, e);
+}
+#endif
+vec2 f_add(vec2 a, vec2 b) {
+    vec2 s = two_sum(a.x, b.x);
+    precise float t = s.y + (a.y + b.y);
+    return quick_two_sum(s.x, t);
+}
+vec2 f_mul(vec2 a, vec2 b) {
+    vec2 p = two_prod(a.x, b.x);
+    precise float t = p.y + (a.x * b.y + a.y * b.x);
+    return quick_two_sum(p.x, t);
+}
+vec4 C(vec2 re, vec2 im) { return vec4(re.x, im.x, re.y, im.y); }
+vec4 c_add(vec4 a, vec4 b) { return C(f_add(a.xz, b.xz), f_add(a.yw, b.yw)); }
+vec4 c_mul(vec4 a, vec4 b) {
+    return C(f_add(f_mul(a.xz, b.xz), -f_mul(a.yw, b.yw)), f_add(f_mul(a.xz, b.yw), f_mul(a.yw, b.xz)));
+}
+vec4 c_sqr(vec4 a) {
+    return C(f_add(f_mul(a.xz, a.xz), -f_mul(a.yw, a.yw)), 2.0 * f_mul(a.xz, a.yw));
+}
+float c_max(vec4 a) { return max(abs(a.x), abs(a.y)); }
+
+// S w^2 of the perturbation step.  When it is below 2^-24 of the 2 Z w term (the delta is far
+// below the reference value: almost always at depth) float rounding of it stays below the
+// float-float precision of the sum, and 3 multiplications replace 4 float-float products.
+vec4 sq_term(vec4 w, float S, vec2 Z) {
+    if (S * c_max(w) < 5.9604645e-8 * max(abs(Z.x), abs(Z.y))) {
+        vec2 q = vec2(w.x * w.x - w.y * w.y, 2.0 * w.x * w.y) * S;
+        return vec4(q, 0.0, 0.0);
+    }
+    return c_sqr(w) * S;
+}
+
+// complex floatexp with a float-float mantissa
+struct FE { vec4 m; int e; };
+FE fe_norm(FE a) {
+    float mx = c_max(a.m);
+    if (mx == 0.0) return FE(vec4(0.0), EXP_ZERO);
+    int d = expf(mx);
+    return FE(scale4(a.m, -d), a.e + d);
+}
+FE fe_add(FE a, FE b) {
+    if (a.e == EXP_ZERO) return b;
+    if (b.e == EXP_ZERO) return a;
+    int e = max(a.e, b.e);
+    return FE(c_add(scale4(a.m, a.e - e), scale4(b.m, b.e - e)), e);
+}
+float fe_log2abs(FE a) {
+    if (a.e == EXP_ZERO) return -1e30;
+    float q = dot(a.m.xy, a.m.xy);
+    if (q == 0.0) return -1e30;
+    return float(a.e) + 0.5 * log2(q);
+}
+
+// complex floatexp with float mantissa (derivatives)
+struct FF { vec2 m; int e; };
+FF ff_norm(FF a) {
+    float mx = max(abs(a.m.x), abs(a.m.y));
+    if (mx == 0.0) return FF(vec2(0.0), EXP_ZERO);
+    int d = expf(mx);
+    return FF(scale2f(a.m, -d), a.e + d);
+}
+FF ff_add(FF a, FF b) {
+    if (a.e == EXP_ZERO) return b;
+    if (b.e == EXP_ZERO) return a;
+    int e = max(a.e, b.e);
+    return FF(scale2f(a.m, a.e - e) + scale2f(b.m, b.e - e), e);
+}
+
+FE pixel_dc(uint sx, uint sy) {
+    vec2 q = vec2(float(int(sx) + uTileOrigin.x) + 0.5 + uJitter.x - uImgHalf.x,
+                  -(float(int(sy) + uTileOrigin.y) + 0.5 + uJitter.y - uImgHalf.y));
+    vec2 qr = vec2(uRot.x * q.x - uRot.y * q.y, uRot.y * q.x + uRot.x * q.y);
+    vec4 dcu = c_add(uOff, vec4(qr, 0.0, 0.0));
+    return fe_norm(FE(C(f_mul(dcu.xz, uHm), f_mul(dcu.yw, uHm)), uHe));
+}
+
+void finish(uint idx, inout Pix s, uint nres, float frac, float de, float ang, float zarg, float stripe) {
+    s.status = ST_DONE;
+    res[idx] = Result(nres, frac, de, ang, zarg, stripe, 0.0, 0.0);
+    atomicAdd(doneCount, 1u);
+    if (nres < RES_INTERIOR) {
+        atomicMin(minIter, nres);
+        atomicMax(maxIter, nres);
+    } else if (nres == RES_MAXITER) {
+        atomicAdd(maxIterCount, 1u);
+    } else {
+        atomicAdd(interiorCount, 1u);
+    }
+}
+
+// the escape (shared by both checks): z is the float value of the escaped orbit point
+void escaped(uint idx, inout Pix s, vec2 zf, float log2B, float log2h) {
+    float r2 = dot(zf, zf);
+    float lr2 = log2(r2);
+    float frac = 1.0 - log2(0.5 * lr2 / log2B);
+    float de = 0.0, ang = 0.0;
+#ifdef WITH_DE
+    float l2D = float(s.De) + 0.5 * log2(dot(s.Dm, s.Dm));
+    float l2z = 0.5 * lr2;
+    float l2de = l2z + log2(l2z * 0.6931471805599453) - l2D - log2h;
+    de = exp2(clamp(l2de, -120.0, 120.0));
+    vec2 u = cmulf(zf, vec2(s.Dm.x, -s.Dm.y));
+    ang = atan(u.y, u.x);
+#endif
+    float zarg = atan(zf.y, zf.x);
+    float stripe = 0.0;
+#ifdef WITH_STRIPES
+    {
+        float fz = 0.5 + 0.5 * sin(uStripeFreq * zarg);
+        float cur = mix(s.sAvg, fz, uStripeDecay);
+        stripe = mix(s.sAvg, cur, clamp(frac, 0.0, 1.0));
+    }
+#endif
+    finish(idx, s, max(s.n, 1u), frac, de, ang, zarg, stripe);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uCount) return;
+    uint idx = (uMode == 0u) ? order[uStart + gid] : pendIn[uStart + gid];
+    Pix s = state[idx];
+    if (s.status == ST_DONE) return;
+    gOnB = uJulia == 0u || (s.m & 0x80000000u) != 0u;
+    s.m &= 0x7FFFFFFFu;
+    uint sx = idx % uField.x;
+    uint sy = idx / uField.x;
+    FE dc = pixel_dc(sx, sy);
+
+    if (s.status == ST_NEW) {
+        s.w = dc.m; s.k = dc.e;
+        if (dc.e == EXP_ZERO) { s.w = vec4(0.0); s.k = 0; }
+        s.m = 1u; s.n = 1u;
+        if (uJulia != 0u) { s.m = 0u; s.n = 0u; gOnB = false; }
+        s.Dm = vec2(1.0, 0.0); s.De = 0;
+        s.Em = vec2(1.0, 0.0); s.Ee = 0;
+        s.sAvg = 0.0; s.sPrev = 0.0;
+        s.status = ST_RUN;
+    }
+
+    if (uJulia != 0u) dc = FE(vec4(0.0), EXP_ZERO);
+    float Sf = pow2f(s.k);
+    vec4 d = scale4(dc.m, dc.e - s.k);
+    bool dcfast = (dc.e - s.k) <= RB;
+    float log2B = 0.5 * log2(uBail2);
+    float log2h = log2(uHm.x) + float(uHe);
+
+    uint steps = 0u;
+    uint nbla = 0u;
+    uint nfail = 0u;
+    uint nreb = 0u;
+    uint blaHold = 0u;
+    uint blaMiss = 0u;
+    bool done = false;
+
+    while (true) {
+        // ------------------------------------------------ check phase
+        uint m = s.m;
+        RefQ zr = refF[refBase() + m];
+        bool zsmall = zr.aux.x != 0.0 && !(m == 0u && s.k > SMALL_EXP);
+        int ze = zsmall ? refE[refBase() + m] : 0;
+        vec2 z;              // float value of the full orbit point (tests, derivatives, colouring)
+        FE zfe;
+        bool rebase = false;
+        if (!zsmall) {
+            vec2 dzv = Sf * s.w.xy;
+            z = zr.z.xy + dzv;
+            float r2 = dot(z, z);
+            if (r2 > uBail2) {
+                escaped(idx, s, z, log2B, log2h);
+                done = true;
+                break;
+            }
+            rebase = (m + 1u >= refLen() && refPer() == 0u) || (r2 < dot(dzv, dzv));
+            if (rebase) {
+                zfe = fe_norm(FE(c_add(zr.z, s.w * Sf), 0));
+            }
+        } else {
+            zfe = fe_norm(fe_add(FE(refM[refBase() + m], ze), FE(s.w, s.k)));
+            z = scale2f(zfe.m.xy, zfe.e);
+            float r2 = dot(z, z);
+            if (r2 > uBail2) {
+                escaped(idx, s, z, log2B, log2h);
+                done = true;
+                break;
+            }
+            float lz = fe_log2abs(zfe);
+            float ldz = fe_log2abs(FE(s.w, s.k));
+            rebase = (m + 1u >= refLen() && refPer() == 0u) || (lz < ldz);
+        }
+        if (rebase) {
+            s.w = zfe.m; s.k = zfe.e;
+            if (zfe.e == EXP_ZERO) { s.w = vec4(0.0); s.k = 0; }
+            m = 0u;
+            s.m = 0u;
+            Sf = pow2f(s.k);
+            d = scale4(dc.m, dc.e - s.k);
+            dcfast = (dc.e - s.k) <= RB;
+            gOnB = true;
+            ze = refE[uBaseB];
+            zsmall = !(s.k > SMALL_EXP);
+            if (!zsmall) { zr = refF[uBaseB]; z = Sf * s.w.xy; }
+            nreb++;
+            blaHold = 0u; blaMiss = 0u;
+        }
+#ifdef WITH_INTERIOR
+        {
+            float me0 = max(abs(s.Em.x), abs(s.Em.y));
+            if (me0 == 0.0 || s.Ee + expf(me0) < uInteriorExp) {
+                finish(idx, s, RES_INTERIOR, float(s.n), 0.0, 0.0, 0.0, 0.0);
+                done = true;
+                break;
+            }
+        }
+#endif
+        if (s.n >= uMaxIter) {
+            finish(idx, s, RES_MAXITER, 0.0, 0.0, 0.0, 0.0, 0.0);
+            done = true;
+            break;
+        }
+        if (steps >= uBudget) break;
+        steps++;
+
+        // ------------------------------------------------ step phase
+        bool stepped = false;
+        bool plain = false;
+        if (uUseBla != 0u && m >= 1u && blaLevels() > uLev0) {
+            uint mm = m - 1u;
+            uint mask0 = (1u << uint(uLev0)) - 1u;
+            float mwg = c_max(s.w);
+            if ((mm & mask0) == 0u && m >= blaHold
+                    && (mwg == 0.0 || float(s.k + expf(mwg) - 1) < blaMaxLogR())) {
+                float lw = float(s.k) + 0.5 * log2(dot(s.w.xy, s.w.xy));
+                int best = -1;
+                uint bidx = 0u;
+                for (int j = uLev0; j < blaLevels(); ++j) {
+                    uint maskj = (1u << uint(j)) - 1u;
+                    if ((mm & maskj) != 0u) break;
+                    uint i = mm >> uint(j);
+                    if (i >= levCnt(j)) break;
+                    uint l = 1u << uint(j);
+                    if (s.n + l > uMaxIter) break;
+                    uint e = levOff(j) + i;
+                    if (!(lw < bla[e].logR)) break;
+                    best = j;
+                    bidx = e;
+                }
+                if (best < 0 && uBlaBackoff != 0u) {
+                    blaMiss = min(blaMiss + 1u, 8u);
+                    blaHold = m + ((1u << uint(uLev0)) << blaMiss);
+                }
+                if (best < 0) nfail++;
+                if (best >= 0) {
+                    BLA b = bla[bidx];
+                    uint l = 1u << uint(best);
+                    blaMiss = 0u;
+                    bool fast = false;
+                    if (uBlaFast != 0u && b.Ae != EXP_ZERO && mwg != 0.0) {
+                        int kn = s.k + b.Ae;
+                        bool hasc = dc.e != EXP_ZERO;
+                        int eb = hasc ? b.Be + dc.e - kn : -100000;
+                        int ec = -100000, ed = -100000, ee = -100000;
+                        BLAQ q;
+                        if (uBlaOrder == 2u) {
+                            q = blaq[bidx];
+                            if (q.Ce != EXP_ZERO) ec = q.Ce + 2 * s.k - kn;
+                            if (hasc && q.De != EXP_ZERO) ed = q.De + s.k + dc.e - kn;
+                            if (hasc && q.Ee != EXP_ZERO) ee = q.Ee + 2 * dc.e - kn;
+                        }
+                        if (max(max(eb, ec), max(ed, ee)) <= FAST_OFF) {
+                            vec4 nw = c_mul(b.Am, s.w);
+                            if (hasc) nw = c_add(nw, scale4(c_mul(b.Bm, dc.m), eb));
+                            if (uBlaOrder == 2u) {
+                                if (ec > -280) nw = c_add(nw, scale4(c_mul(q.Cm, c_sqr(s.w)), ec));
+                                if (ed > -280) nw = c_add(nw, scale4(c_mul(q.Dm, c_mul(s.w, dc.m)), ed));
+                                if (ee > -280) nw = c_add(nw, scale4(c_mul(q.Em, c_sqr(dc.m)), ee));
+                            }
+                            s.w = nw;
+                            s.k = kn;
+                            if (c_max(nw) == 0.0) s.k = 0;
+                            fast = true;
+                        }
+                    }
+                    if (!fast) {
+                        FE aw = FE(c_mul(b.Am, s.w), b.Ae);
+                        FE bd = FE(c_mul(b.Bm, dc.m), b.Be + dc.e - s.k);
+                        if (dc.e == EXP_ZERO) bd = FE(vec4(0.0), EXP_ZERO);
+                        FE sum = fe_add(aw, bd);
+                        if (uBlaOrder == 2u) {
+                            BLAQ q = blaq[bidx];
+                            if (q.Ce != EXP_ZERO) sum = fe_add(sum, FE(c_mul(q.Cm, c_sqr(s.w)), q.Ce + s.k));
+                            if (dc.e != EXP_ZERO) {
+                                if (q.De != EXP_ZERO) sum = fe_add(sum, FE(c_mul(q.Dm, c_mul(s.w, dc.m)), q.De + dc.e));
+                                if (q.Ee != EXP_ZERO) sum = fe_add(sum, FE(c_mul(q.Em, c_sqr(dc.m)), q.Ee + 2 * dc.e - s.k));
+                            }
+                        }
+                        FE nw = fe_norm(sum);
+                        if (nw.e == EXP_ZERO) { s.w = vec4(0.0); }
+                        else { s.w = nw.m; s.k += nw.e; }
+                    }
+#ifdef WITH_DE
+                    FF dd = ff_add(FF(cmulf(b.Am.xy, s.Dm), b.Ae + s.De), FF(b.Bm.xy, uDOne != 0.0 ? b.Be : EXP_ZERO));
+                    dd = ff_norm(dd);
+                    s.Dm = dd.m; s.De = dd.e;
+#endif
+#ifdef WITH_INTERIOR
+                    FF ee = ff_norm(FF(cmulf(b.Am.xy, s.Em), b.Ae + s.Ee));
+                    s.Em = ee.m; s.Ee = ee.e;
+#endif
+                    s.m = wrapm(m + l);
+                    s.n += l;
+                    Sf = pow2f(s.k);
+                    d = scale4(dc.m, dc.e - s.k);
+                    dcfast = (dc.e - s.k) <= RB;
+                    nbla++;
+                    stepped = true;
+                }
+            }
+        }
+        if (!stepped) {
+#ifdef WITH_STRIPES
+            if (m > 0u || s.n > 1u) {
+                float fz = 0.5 + 0.5 * sin(uStripeFreq * atan(z.y, z.x));
+                s.sPrev = s.sAvg;
+                s.sAvg = mix(s.sAvg, fz, uStripeDecay);
+            }
+#endif
+            plain = !zsmall && dcfast;
+            if (plain) {
+#ifdef WITH_DE
+                s.Dm = 2.0 * cmulf(z, s.Dm) + vec2(pow2f(-s.De) * uDOne, 0.0);
+#endif
+#ifdef WITH_INTERIOR
+                s.Em = 2.0 * cmulf(z, s.Em);
+#endif
+                s.w = c_add(c_add(2.0 * c_mul(zr.z, s.w), sq_term(s.w, Sf, zr.z.xy)), d);
+            } else {
+                if (!rebase && !zsmall) { zfe = fe_norm(FE(vec4(z, 0.0, 0.0), 0)); }
+                ze = refE[refBase() + m];
+                FE t1 = (ze == EXP_ZERO) ? FE(vec4(0.0), EXP_ZERO) : FE(2.0 * c_mul(refM[refBase() + m], s.w), ze);
+                FE t2 = FE(c_sqr(s.w), s.k);
+                FE t3 = (dc.e == EXP_ZERO) ? FE(vec4(0.0), EXP_ZERO) : FE(dc.m, dc.e - s.k);
+                FE nw = fe_norm(fe_add(fe_add(t1, t2), t3));
+#ifdef WITH_DE
+                FF dd = ff_add(FF(2.0 * cmulf(zfe.m.xy, s.Dm), zfe.e + s.De), FF(vec2(1.0, 0.0), uDOne != 0.0 ? 0 : EXP_ZERO));
+                dd = ff_norm(dd);
+                s.Dm = dd.m; s.De = dd.e;
+#endif
+#ifdef WITH_INTERIOR
+                FF ee = ff_norm(FF(2.0 * cmulf(zfe.m.xy, s.Em), zfe.e + s.Ee));
+                s.Em = ee.m; s.Ee = ee.e;
+#endif
+                if (nw.e == EXP_ZERO) { s.w = vec4(0.0); }
+                else { s.w = nw.m; s.k += nw.e; }
+                Sf = pow2f(s.k);
+                d = scale4(dc.m, dc.e - s.k);
+                dcfast = (dc.e - s.k) <= RB;
+            }
+            s.m = wrapm(m + 1u);
+            s.n += 1u;
+#if !defined(WITH_STRIPES) && defined(RUN_LENGTH)
+            if (plain && uRun != 0u && nreb * 4u <= steps) {
+                uint lim = min(min(uMaxIter - s.n, uBudget - steps), uRun);
+#ifdef WITH_DE
+                vec2 one = vec2(pow2f(-s.De) * uDOne, 0.0);
+#endif
+                uint mask0r = (1u << uint(uLev0)) - 1u;
+                bool blaOn = uUseBla != 0u && blaLevels() > uLev0;
+#ifdef WITH_INTERIOR
+                float emin = 3.0e38;
+#endif
+                for (uint r = 0u; r < lim; ++r) {
+                    uint mr = s.m;
+                    if (mr + 1u >= refLen()) break;
+                    RefQ zq = refF[refBase() + mr];
+                    if (zq.aux.x != 0.0) break;
+                    float mwr = c_max(s.w);
+                    if (mwr < W_LO || mwr > W_HI) break;
+                    if (blaOn && ((mr - 1u) & mask0r) == 0u && mr >= blaHold) {
+                        float lwq = float(s.k + expf(mwr) - 1);
+                        if (lwq < blaMaxLogR()) {
+                            if (uBlaPrefilter == 0u) break;
+                            uint i0 = (mr - 1u) >> uint(uLev0);
+                            if (i0 < levCnt(uLev0) && lwq < bla[levOff(uLev0) + i0].logR) break;
+                        }
+                    }
+                    vec2 dzv = Sf * s.w.xy;
+                    vec2 zz = zq.z.xy + dzv;
+                    float r2 = dot(zz, zz);
+                    if (r2 > uBail2 || r2 < dot(dzv, dzv)) break;
+#ifdef WITH_DE
+                    s.Dm = 2.0 * cmulf(zz, s.Dm) + one;
+#endif
+#ifdef WITH_INTERIOR
+                    s.Em = 2.0 * cmulf(zz, s.Em);
+                    emin = min(emin, max(abs(s.Em.x), abs(s.Em.y)));
+#endif
+                    s.w = c_add(c_add(2.0 * c_mul(zq.z, s.w), sq_term(s.w, Sf, zq.z.xy)), d);
+                    s.m = mr + 1u;
+                    s.n += 1u;
+                    steps++;
+                }
+#ifdef WITH_INTERIOR
+                if (emin == 0.0 || (emin < 3.0e38 && s.Ee + expf(emin) < uInteriorExp))
+                    s.Em = vec2(emin, 0.0);
+#endif
+            }
+#endif
+        }
+        // ------------------------------------------------ renormalise
+        float mw = c_max(s.w);
+        if (mw != 0.0) {
+            int ew = expf(mw);
+            if (ew > RB || ew < -RB) {
+                s.w = scale4(s.w, -ew);
+                s.k += ew;
+                Sf = pow2f(s.k);
+                d = scale4(dc.m, dc.e - s.k);
+                dcfast = (dc.e - s.k) <= RB;
+            }
+        }
+#ifdef WITH_DE
+        {
+            float md = max(abs(s.Dm.x), abs(s.Dm.y));
+            if (md != 0.0) {
+                int ed = expf(md);
+                if (ed > 40 || ed < -40) { s.Dm = scale2f(s.Dm, -ed); s.De += ed; }
+            }
+        }
+#endif
+#ifdef WITH_INTERIOR
+        {
+            float me = max(abs(s.Em.x), abs(s.Em.y));
+            if (me != 0.0) {
+                int ee2 = expf(me);
+                if (ee2 > 40 || ee2 < -40) { s.Em = scale2f(s.Em, -ee2); s.Ee += ee2; }
+            } else {
+                s.Ee = -100000;
+                s.Em = vec2(1.0, 0.0);
+            }
+        }
+#endif
+    }
+
+    if (uJulia != 0u && gOnB) s.m |= 0x80000000u;
+    state[idx] = s;
+    if (!done) {
+        uint p = atomicAdd(pendCount, 1u);
+        pendOut[p] = idx;
+    }
+    uint old = atomicAdd(stepsLo, steps);
+    if (old + steps < old) atomicAdd(stepsHi, 1u);
+    if (nbla > 0u) atomicAdd(blaSkips, nbla);
+    if (nfail > 0u) atomicAdd(blaFails, nfail);
+    if (nreb > 0u) atomicAdd(rebases, nreb);
+}

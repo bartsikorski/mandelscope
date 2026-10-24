@@ -1,0 +1,11 @@
+{
+ "title": "Ships on the needle",
+ "formula": "ship",
+ "view": {
+  "re": "-1.86",
+  "im": "0.0012",
+  "log2r": -10.702749878828293,
+  "angle": 0.0,
+  "max_iter": 3000
+ }
+}
