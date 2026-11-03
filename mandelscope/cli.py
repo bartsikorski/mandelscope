@@ -13,7 +13,8 @@ from pathlib import Path
 def make_headless_context():
     import moderngl
     errors = []
-    for kw in ({}, {"backend": "egl"}):
+    # (glcontext has no EGL backend on Windows: trying it there only hid the real error)
+    for kw in ({},) + (() if sys.platform == "win32" else ({"backend": "egl"},)):
         try:
             return moderngl.create_standalone_context(require=430, **kw)
         except Exception as e:      # pragma: no cover - platform dependent

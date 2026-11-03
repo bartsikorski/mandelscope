@@ -195,8 +195,10 @@ def gpu_check() -> tuple[bool, str]:
             return False, f"only {name}"
         return True, name
     except Exception as e:          # noqa: BLE001 - any failure means: no usable driver
+        # every attempt (the first one is the one that matters; the last was only a fallback)
         lines = [ln.strip() for ln in str(e).splitlines() if ln.strip()]
-        return False, (lines[-1] if lines else type(e).__name__)[:200]
+        lines = [ln for ln in lines if not ln.startswith("Could not create an OpenGL")]
+        return False, ("; ".join(lines) if lines else type(e).__name__)[:600]
 
 
 # ----------------------------------------------------------------------------- download (Windows)
