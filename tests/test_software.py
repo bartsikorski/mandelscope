@@ -14,6 +14,9 @@ import pytest
 from mandelscope import software
 
 ROOT = Path(__file__).resolve().parents[1]
+# the session's mode, read before the fixture below clears MANDELSCOPE_SOFTWARE for every test
+# (CPU mode: the Windows CI job; conftest has switched this process to Mesa already)
+CPU_MODE = os.environ.get("MANDELSCOPE_SOFTWARE") == "1"
 
 
 @pytest.fixture(autouse=True)
@@ -183,7 +186,11 @@ def test_gpu_check_accepts_this_driver():
     code = ("import os; from mandelscope import software\n"
             "if os.environ.get('MANDELSCOPE_SOFTWARE') == '1': software.enable()\n"
             "print(repr(software.gpu_check()))")
-    r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120)
+    # (in the session's mode: without it the child used the system's opengl32.dll, which on the
+    # Windows CI runner - no graphics card - is OpenGL 1.1 without wglCreateContextAttribsARB)
+    env = {**os.environ, software.ENV: "1"} if CPU_MODE else None
+    r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120,
+                       env=env)
     assert r.returncode == 0, r.stderr
     ok, name = eval(r.stdout.strip().splitlines()[-1])
     assert ok, name
