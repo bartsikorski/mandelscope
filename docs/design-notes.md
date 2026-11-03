@@ -537,6 +537,28 @@ each).  The tour runs the explorer with a scripted session (the selftest machine
 every displayed frame, but only the last frame while a picture refines, so the software
 renderer gives the same animation as a GPU.
 
+**v3.14 (November 2026: glitches at minibrots inside minibrots).**  The periodicity shortcut of
+the reference orbit compared the last two candidate cycles in float64, relative to 1 + |Z|.
+Near a minibrot nested in another one the orbit shadows a repelling cycle of the outer
+minibrot (or a multiple of its period) to within 2^-57 ... 2^-120 for a while, at the phase
+where the check looks; float64 cannot see the difference, the segment contains the near-zero
+value (so the multiplier estimate said "attracting"), and the wrong period was tiled: at the
+nucleus of a period-600 minibrot inside the period-30 one near -2, period 150; period 320
+instead of 400, 150 instead of 240 (`test_periodic_shortcut_at_nested_minibrots`).  On the
+software renderer a view of the period-600 minibrot drew pixels that escape after 82,000 -
+101,000 iterations as inside.  A few more full-precision returns do not settle it either: the
+returns of a shadowed cycle can shrink for a period or two before they grow.  Now each float64
+candidate p (up to 4 per check) goes through Newton's method on F^p(w) = w from the orbit's
+last value: accepted only when the periodic point exists right there (within 2^-50), is exact
+at the working precision, and its cycle attracts (|dF^p/dz| < 1).  Cost: a few times p
+iterations per check.  A first version demanded that the orbit itself return to full
+precision: right at a nucleus, but references elsewhere inside a minibrot converge that far
+only after hundreds of periods, were computed to the limit instead (period-153231 minibrot,
+w = 0.1: 19.7 instead of 1.5 s) and brought back the lag when zooming out of a minibrot
+(selftest `zoom_out`, RTX 5060 Ti: 46-62 frames without skip tables instead of <= 17).  The
+Burning Ship has no complex derivative through the fold: its cycles are accepted only when
+exact at the working precision (at a mini ship's nucleus, as the finder puts them).
+
 ## 6. Possible next steps
 
 * BLA for the Burning Ship (skips are valid only while the deltas change no signs).

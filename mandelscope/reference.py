@@ -133,11 +133,14 @@ def xy_floatexp(vals: list, zc: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return m, e.astype(np.int32)
 
 
-def _detect_period(zc: np.ndarray, max_p: int = 1 << 21) -> int:
-    """Return period p if the tail of the orbit sits on an attracting cycle."""
+def _period_candidates(zc: np.ndarray, max_p: int = 1 << 21, max_tries: int = 64) -> list[int]:
+    """Periods p (smallest first) for which the tail of the orbit looks like an attracting
+    cycle in float64.  Only candidates: near a minibrot nested in another one the orbit
+    shadows the outer minibrot's cycle (or a multiple of it) far closer than float64 can tell
+    apart, so each one must still be confirmed in full precision (``_confirm_period``)."""
     n = zc.shape[0]
     if n < 64:
-        return 0
+        return []
     last = zc[-1]
     scale = 1.0 + abs(last)
     lim = min(n // 2, max_p)
@@ -145,10 +148,9 @@ def _detect_period(zc: np.ndarray, max_p: int = 1 << 21) -> int:
     d = np.abs(window - last)
     tol = 4e-15 * scale
     cand = np.nonzero(d <= tol)[0]
-    if cand.size == 0:
-        return 0
+    out = []
     # smallest p  <->  largest index in window
-    for ci in cand[::-1][:8]:
+    for ci in cand[::-1][:max_tries]:
         p = (lim - ci)
         if p < 1 or 2 * p > n - 2:
             continue
@@ -160,8 +162,72 @@ def _detect_period(zc: np.ndarray, max_p: int = 1 << 21) -> int:
         with np.errstate(divide="ignore"):
             loglam = float(np.sum(np.log2(np.maximum(np.abs(2.0 * a), 1e-300))))
         if loglam < -1.0:          # attracting cycle
-            return int(p)
-    return 0
+            out.append(int(p))
+    return out
+
+
+def _detect_period(zc: np.ndarray, max_p: int = 1 << 21) -> int:
+    """The smallest float64 period candidate (0: none).  Not proof of periodicity on its own -
+    see ``_period_candidates``."""
+    c = _period_candidates(zc, max_p)
+    return c[0] if c else 0
+
+
+def _cycle_map(z, c, p: int):
+    """(F^p(z), dF^p/dz) for F(z) = z^2 + c, in the precision of the context."""
+    w = z
+    dw = mpc(1)
+    for _ in range(p):
+        dw = 2 * w * dw
+        w = gmpy2.square(w) + c
+    return w, dw
+
+
+def _confirm_period(z, c, p: int, prec: int, ship: bool = False, newton_steps: int = 8) -> bool:
+    """True if the full-precision orbit at z (its last value) really sits on an attracting
+    p-cycle, so tiling its last p values continues it as accurately as float64 stores them.
+
+    Newton's method on F^p(w) = w, started at z, finds the p-periodic point z* next to z (a few
+    times p iterations; z* = z at a minibrot's nucleus).  Accepted when z* exists at this
+    precision, the cycle through it attracts (|dF^p/dz| < 1 at z*), and z is within 2^-50 of it
+    (relative to 1 + |z|) - the orbit has converged onto it as far as float64 can tell; later
+    checks try again otherwise.
+
+    Why: near a minibrot nested in another one the orbit shadows a *repelling* cycle of the
+    outer minibrot (or a multiple of its period) far closer than float64 - or even a few
+    returns in full precision - can tell apart from a cycle; tiling it gave a wrong reference
+    orbit.  A repelling cycle has |dF^p/dz| > 1 at its periodic points, which rejects it.
+
+    The Burning Ship (no complex derivative through the fold): only a cycle that is already
+    exact at this precision (|F^p(z) - z| <= 2^-(prec-64) (1 + |z|)) is accepted."""
+    scale = 1 + abs(z)
+    exact = scale * gmpy2.exp2(mpfr(64 - prec))
+    if ship:
+        w = z
+        for _ in range(p):
+            v = gmpy2.square(w)
+            if (w.real < 0) != (w.imag < 0):
+                v = v.conjugate()
+            w = v + c
+        return bool(abs(w - z) <= exact)
+    zs = z
+    w, dw = _cycle_map(zs, c, p)
+    for _ in range(newton_steps):
+        g = w - zs
+        if g == 0 or abs(g) <= exact:
+            break                        # (w, dw) belong to zs
+        den = dw - 1
+        if den == 0:
+            return False
+        zs = zs - g / den
+        if abs(zs - z) > scale * gmpy2.exp2(mpfr(-40)):
+            return False                 # Newton went elsewhere: no cycle next to z
+        w, dw = _cycle_map(zs, c, p)
+    else:
+        return False                     # no convergence
+    if not abs(dw) < 1:
+        return False                     # repelling (or neutral): only shadowed for a while
+    return bool(abs(z - zs) <= scale * gmpy2.exp2(mpfr(-50)))
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +290,8 @@ def compute_reference(re: str, im: str, prec: int, max_iter: int,
     (with a lower iteration cap) before it is complete.
     """
     t0 = time.perf_counter()
+    import os as _os
+    _log = _os.environ.get("MS_REFLOG")
     ctx = gmpy2.get_context()
     old_prec = ctx.precision
     ctx.precision = prec
@@ -307,9 +375,13 @@ def compute_reference(re: str, im: str, prec: int, max_iter: int,
                 return r
             if allow_period and n > 256 and (n >= next_check or n >= total):
                 next_check = n + max(4 * chunk, n // 4)
-                p = _detect_period(buf.f[:buf.n])
-                if p:
-                    period = p
+                # float64 candidates, each confirmed in full precision (at most a few: each
+                # confirmation costs p more iterations)
+                for p in _period_candidates(buf.f[:buf.n])[:4]:
+                    if _confirm_period(z, c, p, prec, ship):
+                        period = p
+                        break
+                if period:
                     break
             if partial is not None and n < total and time.perf_counter() - t0 >= next_partial:
                 next_partial = 2.0 * (time.perf_counter() - t0)
@@ -322,6 +394,9 @@ def compute_reference(re: str, im: str, prec: int, max_iter: int,
         arrs = tuple(a.copy() for a in buf.arrays())      # not views of the (larger) buffers
         zf, zm, ze, *xy = arrs
         state = None if (escaped or period) else (z, n)
+        if _log:
+            with open(_log, "a") as fh:
+                fh.write(f"{re[:14]} {im[:14]} prec={prec} max_iter={max_iter} len={buf.n} period={period} esc={escaped} t={time.perf_counter()-t0:.3f} resume={resume is not None}\n")
         return ReferenceOrbit(re=re, im=im, prec=prec, zf=zf, zm=zm, ze=ze,
                               escaped=escaped, period=period, max_iter=max_iter,
                               state=state, elapsed=time.perf_counter() - t0,

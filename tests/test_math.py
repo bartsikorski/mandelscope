@@ -73,6 +73,51 @@ def test_periodic_shortcut_matches_direct():
         assert abs(ref.zf[ref.index(i)] - complex(orbit[i])) < 1e-12, i
 
 
+def _nested_nucleus(p, q, prec):
+    """Nucleus of a period p*q minibrot nested in the period-p minibrot near -2 (at the spot of
+    its own period-q minibrot near -2): "a minibrot inside a minibrot"."""
+    with gmpy2.context(gmpy2.get_context(), precision=prec):
+        n1 = newton_nucleus(mpc(mpfr(-2) + mpfr(2) ** (-2 * p + 2)), p, prec, max_steps=200)
+        s1 = size_estimate(n1, p, prec)
+        w2 = newton_nucleus(mpc(mpfr(-2) + mpfr(2) ** (-2 * q + 2)), q, prec, max_steps=200)
+        return newton_nucleus(n1 + s1 * w2, p * q, prec, max_steps=200)
+
+
+@pytest.mark.parametrize("p,q", [(30, 20), (30, 8), (40, 10)])
+def test_periodic_shortcut_at_nested_minibrots(p, q):
+    """At a minibrot inside a minibrot the orbit shadows the outer minibrot's cycle (and some
+    multiples of it) to within ~2^-57..2^-77 for a while: float64 cannot tell it from the true
+    cycle, and the shortcut used to tile the wrong period (150 instead of 600, 320 instead of
+    400), so every pixel was computed against a wrong reference orbit."""
+    prec = 300
+    c = _nested_nucleus(p, q, prec)
+    re, im = to_str(c.real, prec), to_str(c.imag, prec)
+    ref = compute_reference(re, im, prec, 120000)
+    assert ref.period == p * q
+    exact = compute_reference(re, im, prec, 120000, allow_period=False)
+    idx = np.array([ref.index(k) for k in range(exact.length)])
+    assert np.allclose(ref.zf[idx], exact.zf, rtol=1e-9, atol=1e-30)
+
+
+@pytest.mark.parametrize("w", [0.1, -1.0])
+def test_periodic_shortcut_inside_a_minibrot_off_its_nucleus(w):
+    """A reference elsewhere inside a minibrot (the explorer picks a non-escaping pixel) keeps
+    the shortcut: its orbit converges onto an attracting cycle only to float64 accuracy within
+    the limit, not to the full precision (w = 0.1: the cardioid of the period-39 minibrot,
+    -1.0: its period-2 bulb, cycle 78).  The first version of the nested-minibrot fix demanded
+    full precision and computed such orbits to the limit: lag when zooming out of a minibrot."""
+    prec = 200
+    with gmpy2.context(gmpy2.get_context(), precision=prec):
+        n = newton_nucleus(mpc(-0.7436423016578859, 0.13182651981259472), 39, prec)
+        c = n + size_estimate(n, 39, prec) * mpc(w)
+    re, im = to_str(c.real, prec), to_str(c.imag, prec)
+    ref = compute_reference(re, im, prec, 60000, chunk=1024)
+    assert ref.period in (39, 78) and ref.length < 10000
+    exact = compute_reference(re, im, prec, 60000, allow_period=False)
+    idx = np.array([ref.index(k) for k in range(exact.length)])
+    assert np.allclose(ref.zf[idx], exact.zf, rtol=1e-12, atol=1e-30)
+
+
 def test_nucleus_and_size_estimate():
     c = newton_nucleus(mpc(-1.75), 3, 200)
     assert abs(complex(c) - (-1.7548776662466927)) < 1e-15

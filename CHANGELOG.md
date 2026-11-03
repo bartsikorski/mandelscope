@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Minibrots inside minibrots**: a reference orbit at (or inside) a minibrot nested in another one could take the outer minibrot's cycle for its own, e.g. period 150 instead of 600, and repeat it. Every pixel past that point was then computed against a wrong orbit: solid "inside" patches, wrong colours and extra rebasing near nested minibrots. Each cycle the float64 test finds is now confirmed in full precision (Newton's method on the cycle: it must exist next to the orbit and attract). References elsewhere inside a minibrot keep the shortcut.
+
 ## 1.0.0 — first public release
 
 Mandelscope is a GPU deep-zoom Mandelbrot explorer.
