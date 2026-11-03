@@ -133,11 +133,14 @@ def xy_floatexp(vals: list, zc: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return m, e.astype(np.int32)
 
 
-def _detect_period(zc: np.ndarray, max_p: int = 1 << 21) -> int:
-    """Return period p if the tail of the orbit sits on an attracting cycle."""
+def _period_candidates(zc: np.ndarray, max_p: int = 1 << 21, max_tries: int = 64) -> list[int]:
+    """Periods p (smallest first) for which the tail of the orbit looks like an attracting
+    cycle in float64.  Only candidates: near a minibrot nested in another one the orbit
+    shadows the outer minibrot's cycle (or a multiple of it) far closer than float64 can tell
+    apart, so each one must still be confirmed in full precision (``_confirm_period``)."""
     n = zc.shape[0]
     if n < 64:
-        return 0
+        return []
     last = zc[-1]
     scale = 1.0 + abs(last)
     lim = min(n // 2, max_p)
@@ -145,10 +148,9 @@ def _detect_period(zc: np.ndarray, max_p: int = 1 << 21) -> int:
     d = np.abs(window - last)
     tol = 4e-15 * scale
     cand = np.nonzero(d <= tol)[0]
-    if cand.size == 0:
-        return 0
+    out = []
     # smallest p  <->  largest index in window
-    for ci in cand[::-1][:8]:
+    for ci in cand[::-1][:max_tries]:
         p = (lim - ci)
         if p < 1 or 2 * p > n - 2:
             continue
@@ -159,9 +161,72 @@ def _detect_period(zc: np.ndarray, max_p: int = 1 << 21) -> int:
             continue
         with np.errstate(divide="ignore"):
             loglam = float(np.sum(np.log2(np.maximum(np.abs(2.0 * a), 1e-300))))
-        if loglam < -1.0:          # attracting cycle
-            return int(p)
-    return 0
+        # attracting cycle.  (Any |multiplier| < 1: _confirm_period checks it in full precision
+        # and that the tail is on the cycle.  The old float64-only test needed < 1/2, which
+        # missed weakly attracting cycles off a nested minibrot's nucleus.)
+        if loglam < 0.0:
+            out.append(int(p))
+    return out
+
+
+def _detect_period(zc: np.ndarray, max_p: int = 1 << 21) -> int:
+    """The smallest float64 period candidate (0: none).  Not proof of periodicity on its own -
+    see ``_period_candidates``."""
+    c = _period_candidates(zc, max_p)
+    return c[0] if c else 0
+
+
+def _confirm_period(z, c, p: int, prec: int, ship: bool = False, max_newton: int = 8) -> bool:
+    """True if there is an attracting p-cycle at the orbit point z: Newton's method on
+    f^p(w) - w from z finds the exact p-periodic point and its multiplier must be < 1.
+    The float64 test cannot tell a minibrot's cycle from the cycle of the minibrot it is nested
+    in (there the orbit returns to within ~2^-57 or closer for a while, and tiling that cycle
+    gave a wrong reference orbit); that cycle is repelling, so it is rejected here.  Newton
+    converges in a few steps of p iterations even off the nucleus, where the orbit itself
+    approaches the cycle slowly (waiting for it to arrive at full precision made the reference
+    orbit many times longer and the skip tables late).
+    "Exact" is to 2^-(prec-64) relative to 1 + |w|, or to the rounding error of the p iterations
+    when that is larger (the derivative can grow huge part way round the cycle and magnify it):
+    the error is carried along as err_{k+1} = |2 x_k| err_k + (1 + |x_{k+1}|) 2^-(prec-4).
+    The derivative of f^p is kept as the real-linear map dw -> a dw + b conj(dw) (a Burning
+    Ship step is antiholomorphic where x and y have opposite signs; b = 0 for the Mandelbrot
+    set)."""
+    sq = gmpy2.square
+    eps = gmpy2.exp2(mpfr(64 - prec))
+    ulp = gmpy2.exp2(mpfr(4 - prec))
+    w = z
+    for _ in range(max_newton):
+        x, a, b, err = w, mpc(1), mpc(0), mpfr(0)
+        for _ in range(p):
+            h = 2 * x
+            v = sq(x)
+            if ship and (x.real < 0) != (x.imag < 0):
+                v = v.conjugate()
+                a, b = (h * b).conjugate(), (h * a).conjugate()
+            else:
+                a, b = h * a, h * b
+            x = v + c
+            err = abs(h) * err + (1 + abs(x)) * ulp
+        g = x - w
+        if abs(g) <= max((1 + abs(w)) * eps, 16 * err):
+            # the orbit tail that gets tiled must be on the cycle to float64 accuracy (also
+            # rejects Newton going off to another cycle)
+            if abs(w - z) > (1 + abs(z)) * 1e-13:
+                return False
+            # spectral radius of [a, b] as a real 2x2 map (|a| when b = 0)
+            if b == 0:
+                return bool(abs(a) < 1)
+            t, det = a.real, gmpy2.norm(a) - gmpy2.norm(b)       # eigenvalues t +- sqrt(t^2 - det)
+            disc = t * t - det
+            r = abs(t) + gmpy2.sqrt(disc) if disc >= 0 else gmpy2.sqrt(det)
+            return bool(r < 1)
+        # solve (a - 1) d + b conj(d) = -g
+        A = a - 1
+        den = gmpy2.norm(A) - gmpy2.norm(b)
+        if den == 0:
+            return False
+        w = w + (A.conjugate() * -g - b * (-g).conjugate()) / den
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -307,9 +372,19 @@ def compute_reference(re: str, im: str, prec: int, max_iter: int,
                 return r
             if allow_period and n > 256 and (n >= next_check or n >= total):
                 next_check = n + max(4 * chunk, n // 4)
-                p = _detect_period(buf.f[:buf.n])
-                if p:
-                    period = p
+                # float64 candidates, each confirmed in full precision.  Near a nested minibrot
+                # the list starts with multiples of the outer period, so try several: the first
+                # one always, more while their periods add up to n/8 (each Newton step costs p
+                # iterations)
+                budget = n // 8
+                for i, p in enumerate(_period_candidates(buf.f[:buf.n])):
+                    if i and p > budget:
+                        break
+                    budget -= p
+                    if _confirm_period(z, c, p, prec, ship):
+                        period = p
+                        break
+                if period:
                     break
             if partial is not None and n < total and time.perf_counter() - t0 >= next_partial:
                 next_partial = 2.0 * (time.perf_counter() - t0)
