@@ -99,6 +99,37 @@ def test_periodic_shortcut_at_nested_minibrots(p, q):
     assert np.allclose(ref.zf[idx], exact.zf, rtol=1e-9, atol=1e-30)
 
 
+@pytest.mark.parametrize("off", [0.1, 0.3])
+def test_periodic_shortcut_off_nested_nucleus(off):
+    """Off the nucleus the orbit only approaches the cycle (weakly attracting at 0.3: multiplier
+    ~0.86): the period must still be found early.  (Waiting for the orbit to reach the cycle in
+    full precision made the reference orbits many times longer and the skip tables late.)"""
+    prec = 300
+    with gmpy2.context(gmpy2.get_context(), precision=prec):
+        n = _nested_nucleus(30, 20, prec)
+        c = n + size_estimate(n, 600, prec) * mpc(off, off / 3)
+    re, im = to_str(c.real, prec), to_str(c.imag, prec)
+    ref = compute_reference(re, im, prec, 400000)
+    assert ref.period == 600 and ref.length <= 32769
+    exact = compute_reference(re, im, prec, 120000, allow_period=False)
+    idx = np.array([ref.index(k) for k in range(exact.length)])
+    assert np.allclose(ref.zf[idx], exact.zf, rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.parametrize("off", [0.0, 0.3])
+def test_periodic_shortcut_mini_ship(off):
+    re, im, l2 = "-1.77832935517465558049355033", "0.02227250757112231451758436", -36.03
+    prec = 200
+    with gmpy2.context(gmpy2.get_context(), precision=prec):
+        c = mpc(mpfr(re), mpfr(im)) + mpfr(2) ** l2 * mpc(off, -off / 3)
+    re, im = to_str(c.real, prec), to_str(c.imag, prec)
+    ref = compute_reference(re, im, prec, 400000, formula="ship")
+    assert ref.period % 39 == 0 and ref.length <= 32769
+    exact = compute_reference(re, im, prec, 60000, allow_period=False, formula="ship")
+    idx = np.array([ref.index(k) for k in range(exact.length)])
+    assert np.allclose(ref.zf[idx], exact.zf, rtol=1e-9, atol=1e-11)
+
+
 @pytest.mark.parametrize("w", [0.1, -1.0])
 def test_periodic_shortcut_inside_a_minibrot_off_its_nucleus(w):
     """A reference elsewhere inside a minibrot (the explorer picks a non-escaping pixel) keeps

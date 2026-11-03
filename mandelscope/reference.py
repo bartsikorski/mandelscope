@@ -161,7 +161,10 @@ def _period_candidates(zc: np.ndarray, max_p: int = 1 << 21, max_tries: int = 64
             continue
         with np.errstate(divide="ignore"):
             loglam = float(np.sum(np.log2(np.maximum(np.abs(2.0 * a), 1e-300))))
-        if loglam < -1.0:          # attracting cycle
+        # attracting cycle.  (Any |multiplier| < 1: _confirm_period checks it in full precision
+        # and that the tail is on the cycle.  The old float64-only test needed < 1/2, which
+        # missed weakly attracting cycles off a nested minibrot's nucleus.)
+        if loglam < 0.0:
             out.append(int(p))
     return out
 
@@ -173,61 +176,57 @@ def _detect_period(zc: np.ndarray, max_p: int = 1 << 21) -> int:
     return c[0] if c else 0
 
 
-def _cycle_map(z, c, p: int):
-    """(F^p(z), dF^p/dz) for F(z) = z^2 + c, in the precision of the context."""
+def _confirm_period(z, c, p: int, prec: int, ship: bool = False, max_newton: int = 8) -> bool:
+    """True if there is an attracting p-cycle at the orbit point z: Newton's method on
+    f^p(w) - w from z finds the exact p-periodic point and its multiplier must be < 1.
+    The float64 test cannot tell a minibrot's cycle from the cycle of the minibrot it is nested
+    in (there the orbit returns to within ~2^-57 or closer for a while, and tiling that cycle
+    gave a wrong reference orbit); that cycle is repelling, so it is rejected here.  Newton
+    converges in a few steps of p iterations even off the nucleus, where the orbit itself
+    approaches the cycle slowly (waiting for it to arrive at full precision made the reference
+    orbit many times longer and the skip tables late).
+    "Exact" is to 2^-(prec-64) relative to 1 + |w|, or to the rounding error of the p iterations
+    when that is larger (the derivative can grow huge part way round the cycle and magnify it):
+    the error is carried along as err_{k+1} = |2 x_k| err_k + (1 + |x_{k+1}|) 2^-(prec-4).
+    The derivative of f^p is kept as the real-linear map dw -> a dw + b conj(dw) (a Burning
+    Ship step is antiholomorphic where x and y have opposite signs; b = 0 for the Mandelbrot
+    set)."""
+    sq = gmpy2.square
+    eps = gmpy2.exp2(mpfr(64 - prec))
+    ulp = gmpy2.exp2(mpfr(4 - prec))
     w = z
-    dw = mpc(1)
-    for _ in range(p):
-        dw = 2 * w * dw
-        w = gmpy2.square(w) + c
-    return w, dw
-
-
-def _confirm_period(z, c, p: int, prec: int, ship: bool = False, newton_steps: int = 8) -> bool:
-    """True if the full-precision orbit at z (its last value) really sits on an attracting
-    p-cycle, so tiling its last p values continues it as accurately as float64 stores them.
-
-    Newton's method on F^p(w) = w, started at z, finds the p-periodic point z* next to z (a few
-    times p iterations; z* = z at a minibrot's nucleus).  Accepted when z* exists at this
-    precision, the cycle through it attracts (|dF^p/dz| < 1 at z*), and z is within 2^-50 of it
-    (relative to 1 + |z|) - the orbit has converged onto it as far as float64 can tell; later
-    checks try again otherwise.
-
-    Why: near a minibrot nested in another one the orbit shadows a *repelling* cycle of the
-    outer minibrot (or a multiple of its period) far closer than float64 - or even a few
-    returns in full precision - can tell apart from a cycle; tiling it gave a wrong reference
-    orbit.  A repelling cycle has |dF^p/dz| > 1 at its periodic points, which rejects it.
-
-    The Burning Ship (no complex derivative through the fold): only a cycle that is already
-    exact at this precision (|F^p(z) - z| <= 2^-(prec-64) (1 + |z|)) is accepted."""
-    scale = 1 + abs(z)
-    exact = scale * gmpy2.exp2(mpfr(64 - prec))
-    if ship:
-        w = z
+    for _ in range(max_newton):
+        x, a, b, err = w, mpc(1), mpc(0), mpfr(0)
         for _ in range(p):
-            v = gmpy2.square(w)
-            if (w.real < 0) != (w.imag < 0):
+            h = 2 * x
+            v = sq(x)
+            if ship and (x.real < 0) != (x.imag < 0):
                 v = v.conjugate()
-            w = v + c
-        return bool(abs(w - z) <= exact)
-    zs = z
-    w, dw = _cycle_map(zs, c, p)
-    for _ in range(newton_steps):
-        g = w - zs
-        if g == 0 or abs(g) <= exact:
-            break                        # (w, dw) belong to zs
-        den = dw - 1
+                a, b = (h * b).conjugate(), (h * a).conjugate()
+            else:
+                a, b = h * a, h * b
+            x = v + c
+            err = abs(h) * err + (1 + abs(x)) * ulp
+        g = x - w
+        if abs(g) <= max((1 + abs(w)) * eps, 16 * err):
+            # the orbit tail that gets tiled must be on the cycle to float64 accuracy (also
+            # rejects Newton going off to another cycle)
+            if abs(w - z) > (1 + abs(z)) * 1e-13:
+                return False
+            # spectral radius of [a, b] as a real 2x2 map (|a| when b = 0)
+            if b == 0:
+                return bool(abs(a) < 1)
+            t, det = a.real, gmpy2.norm(a) - gmpy2.norm(b)       # eigenvalues t +- sqrt(t^2 - det)
+            disc = t * t - det
+            r = abs(t) + gmpy2.sqrt(disc) if disc >= 0 else gmpy2.sqrt(det)
+            return bool(r < 1)
+        # solve (a - 1) d + b conj(d) = -g
+        A = a - 1
+        den = gmpy2.norm(A) - gmpy2.norm(b)
         if den == 0:
             return False
-        zs = zs - g / den
-        if abs(zs - z) > scale * gmpy2.exp2(mpfr(-40)):
-            return False                 # Newton went elsewhere: no cycle next to z
-        w, dw = _cycle_map(zs, c, p)
-    else:
-        return False                     # no convergence
-    if not abs(dw) < 1:
-        return False                     # repelling (or neutral): only shadowed for a while
-    return bool(abs(z - zs) <= scale * gmpy2.exp2(mpfr(-50)))
+        w = w + (A.conjugate() * -g - b * (-g).conjugate()) / den
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +289,6 @@ def compute_reference(re: str, im: str, prec: int, max_iter: int,
     (with a lower iteration cap) before it is complete.
     """
     t0 = time.perf_counter()
-    import os as _os
-    _log = _os.environ.get("MS_REFLOG")
     ctx = gmpy2.get_context()
     old_prec = ctx.precision
     ctx.precision = prec
@@ -375,9 +372,15 @@ def compute_reference(re: str, im: str, prec: int, max_iter: int,
                 return r
             if allow_period and n > 256 and (n >= next_check or n >= total):
                 next_check = n + max(4 * chunk, n // 4)
-                # float64 candidates, each confirmed in full precision (at most a few: each
-                # confirmation costs p more iterations)
-                for p in _period_candidates(buf.f[:buf.n])[:4]:
+                # float64 candidates, each confirmed in full precision.  Near a nested minibrot
+                # the list starts with multiples of the outer period, so try several: the first
+                # one always, more while their periods add up to n/8 (each Newton step costs p
+                # iterations)
+                budget = n // 8
+                for i, p in enumerate(_period_candidates(buf.f[:buf.n])):
+                    if i and p > budget:
+                        break
+                    budget -= p
                     if _confirm_period(z, c, p, prec, ship):
                         period = p
                         break
@@ -394,9 +397,6 @@ def compute_reference(re: str, im: str, prec: int, max_iter: int,
         arrs = tuple(a.copy() for a in buf.arrays())      # not views of the (larger) buffers
         zf, zm, ze, *xy = arrs
         state = None if (escaped or period) else (z, n)
-        if _log:
-            with open(_log, "a") as fh:
-                fh.write(f"{re[:14]} {im[:14]} prec={prec} max_iter={max_iter} len={buf.n} period={period} esc={escaped} t={time.perf_counter()-t0:.3f} resume={resume is not None}\n")
         return ReferenceOrbit(re=re, im=im, prec=prec, zf=zf, zm=zm, ze=ze,
                               escaped=escaped, period=period, max_iter=max_iter,
                               state=state, elapsed=time.perf_counter() - t0,

@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixed
-- **Minibrots inside minibrots**: a reference orbit at (or inside) a minibrot nested in another one could take the outer minibrot's cycle for its own, e.g. period 150 instead of 600, and repeat it. Every pixel past that point was then computed against a wrong orbit: solid "inside" patches, wrong colours and extra rebasing near nested minibrots. Each cycle the float64 test finds is now confirmed in full precision (Newton's method on the cycle: it must exist next to the orbit and attract). References elsewhere inside a minibrot keep the shortcut.
+- **Minibrots inside minibrots**: a reference orbit at (or inside) a minibrot nested in another one could take the outer minibrot's cycle for its own, e.g. period 150 instead of 600, and repeat it. Every pixel past that point was then computed against a wrong orbit: solid "inside" patches, wrong colours and extra rebasing near nested minibrots. Each cycle the float64 test finds is now confirmed in full precision with Newton's method (the periodic point must exist on the orbit and its cycle must attract). The shortcut now also finds weakly attracting cycles and the basic period instead of a multiple, so references off a minibrot's nucleus stay short; frame times on an RTX 5060 Ti are unchanged (`bench --bla`).
 
 ## 1.0.0 — first public release
 
