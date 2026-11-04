@@ -266,13 +266,13 @@ def bla_bench(eng, w, h, reps: int = 3, names=None, variants=None):
         ("min 64", L, 64, {}),
         ("blocks 2^4", 4, M, {}),
         ("blocks 2^6", 6, M, {}),
-        ("run16", L, M, dict(run_length=16)),
-        ("run64", L, M, dict(run_length=64)),
+        ("run8", L, M, dict(run_length=8)),
+        ("run32", L, M, dict(run_length=32)),
         ("-pre", L, M, dict(bla_prefilter=False)),
     ]
     print(f"\n-- deep renders: skips cut at the orbit's near-zero points (float32, {w}x{h}, best of {reps}) --")
     print(f"    default: blocks of 2^{L} between near-zero points, skips of {M}+ iterations stored;"
-          "  minN: shortest stored skip;  runN: plain iterations per run (default 32);"
+          "  minN: shortest stored skip;  runN: plain iterations per run (default 16);"
           "  -pre: runs leave for every lookup")
     print(f"    {'place':18s}" + "".join(f"{lab:>16s}" for lab, *_ in variants)
           + "      (wall / GPU ms; below: steps / skips / failed lookups per pixel)")

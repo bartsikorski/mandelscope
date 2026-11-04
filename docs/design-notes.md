@@ -622,6 +622,17 @@ renderer, so the time barely moves there; on a GPU the ratio decides, which is w
 percentiles agree to 0.5 % at both minibrots, the 99 % ones to 0.2 % (p153231) and 2.7 %
 (p6006, 144 pixels, chaotic).
 
+The user's RTX 5060 Ti (1920x1080, float32), main -> skip tree.  The user's place (-1.576185...,
+nested minibrots of periods 9,072 and 40,824 near the view): at 10^17.18 and 251,889 iterations
+2.36 -> 0.16 s of GPU time per picture (46,541 -> 736 steps per pixel); at 10^20.04 and
+1,153,980 iterations 5.28 -> 0.30 s, table 2.7 -> 1.3 s.  Escape-count percentiles with skips
+within a few iterations of the plain render.  `bench --bla` (wall ms, run32 | run16): nested
+minibrots 220 | 223, p153231 362 | 333 (main 763), p6006 848 | 682 (main 717), seahorse 21 | 22
+(main 33), spiral and 10^1000 2-3 (main 3-4).  With the old skips run32 beat run16; now the
+runs are 16 iterations long by default (p6006 has 609 skips per pixel: a shorter run leaves
+for a lookup sooner after the pixel's delta has shrunk below the radius again).  Shorter
+minimum skips and blocks of 2^4 / 2^6 lost or tied on the RTX as on the software renderer.
+
 The test `test_nested_minibrots_skip_their_near_zero_points` renders the place with and without
 skips: fewer than 6,000 steps per pixel with them, the escape counts' 10/50/90 % percentiles
 within 2 % of the plain picture (the counts are chaotic there: float32 rounding alone changes

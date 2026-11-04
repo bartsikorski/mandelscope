@@ -653,8 +653,9 @@ class EngineOptions:
     chunk_start: int = 65536              # samples per dispatch at the start of every sweep
     chunk_min: int = 8192                 # never smaller (v3.0 went down to 64 and kept it)
     runs: bool = True                     # plain-float iteration runs without per-step bookkeeping
-    run_length: int = 32                  # iterations per run (derivatives grow <= 4x per iteration;
-                                          # RTX bench: 32 beat 16 by 0-6 %)
+    run_length: int = 16                  # iterations per run (derivatives grow <= 4x per iteration;
+                                          # RTX bench: 32 beat 16 by 0-6 % with the old skips; with the
+                                          # skip tree 16 wins: p6006 682 vs 848 ms, p153231 333 vs 362)
     staged_counters: bool = True          # CPU reads/writes small GPU buffers through a copy
     predictive_budget: bool = True        # stop before a dispatch that would overrun the time slice
     sync_before_step: bool = True         # time slices measure only the field's own dispatches
