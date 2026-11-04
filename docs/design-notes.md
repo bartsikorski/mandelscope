@@ -537,6 +537,35 @@ each).  The tour runs the explorer with a scripted session (the selftest machine
 every displayed frame, but only the last frame while a picture refines, so the software
 renderer gives the same animation as a GPU.
 
+**v3.14 (November 2026: glitches at minibrots inside minibrots).**  The periodicity shortcut of
+the reference orbit compared the last two candidate cycles in float64, relative to 1 + |Z|.
+Near a minibrot nested in another one the orbit shadows a repelling cycle of the outer
+minibrot (or a multiple of its period) to within 2^-57 ... 2^-120 for a while, at the phase
+where the check looks; float64 cannot see the difference, the segment contains the near-zero
+value (so the multiplier estimate said "attracting"), and the wrong period was tiled: at the
+nucleus of a period-600 minibrot inside the period-30 one near -2, period 150; period 320
+instead of 400, 150 instead of 240 (`test_periodic_shortcut_at_nested_minibrots`).  On the
+software renderer a view of the period-600 minibrot drew pixels that escape after 82,000 -
+101,000 iterations as inside.  A few more full-precision returns do not settle it either: the
+returns of a shadowed cycle can shrink for a period or two before they grow.  Now each float64
+candidate p goes through Newton's method on f^p(w) = w from the orbit's last value, with the
+derivative of f^p kept as a real-linear map dw -> a dw + b conj(dw) (a Burning Ship step is
+antiholomorphic where x and y have opposite signs; b = 0 for the Mandelbrot set) and the
+rounding error of the p iterations carried along.  Accepted only when the periodic point is
+exact at the working precision, the orbit's tail is on it to 1e-13, and its cycle attracts
+(spectral radius < 1).  The float64 filter now passes any |multiplier| < 1 (it needed < 1/2,
+which missed weakly attracting cycles off a nested minibrot's nucleus), and several candidates
+are tried per check - the first always, more while their periods add up to n/8 - because
+near a nested minibrot the list starts with multiples of the outer period.  A first version
+demanded that the orbit itself return to full precision: right at a nucleus, but references
+elsewhere inside a minibrot converge that far only after hundreds of periods, were computed to
+the limit instead (period-153231 minibrot, w = 0.1: 19.7 instead of 1.5 s) and brought back
+the lag when zooming out of a minibrot (selftest `zoom_out`, RTX 5060 Ti: 46-62 frames without
+skip tables instead of <= 17).  RTX 5060 Ti, `bench --bla`: frame times and steps / skips per
+pixel unchanged; reference orbits +16-20 ms where a candidate is checked and rejected or
+confirmed (seahorse 10^12: a period-8007 near miss, 24 -> 44 ms; period-6006 minibrot 37 ->
+53 ms).
+
 ## 6. Possible next steps
 
 * BLA for the Burning Ship (skips are valid only while the deltas change no signs).
