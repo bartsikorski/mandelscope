@@ -85,17 +85,205 @@ def _log2_sub(a, b):
     return np.where(a > b, r, -np.inf)
 
 
+# ---------------------------------------------------------------------------
+# structure: which skips exist (depends on the reference only)
+# ---------------------------------------------------------------------------
+
+LA_TAU = -3.0              # a near-zero point ("dip") of the reference: |Z_m| < 2^-3
+LA_DELTA = 2.0             # dips are told apart by depth in steps of 2 bits
+DEFAULT_LEAF_LOG2 = 5      # between dips, the shortest skips are blocks of 2^5 iterations
+MIN_SKIP = 16              # shorter skips are not stored: on a GPU a skip costs about as much as
+                           # 30 plain steps, so short ones only add lookups
+DEFAULT_ORDER = 2
+FAST_LEAF_LOG2 = 6         # blocks of up to 64 iterations can be composed in complex128:
+FAST_ZE = (-11, 9)         # with 2**-12 <= |Z| < 2**9 every product stays far inside float64
+                           # (|A| <= 2**640, |C|, |D|, |E| <= 2**1000; terms that underflow are
+                           # below the rounding of the sums they belong to)
+_TOP = 1 << 20             # depth class of the ends of the reference (boundaries at every stage)
+
+
+@dataclass
+class LAStructure:
+    """The skips of a reference orbit Z_0 .. Z_{L-1}: a tree of segments [a, b) of iterations.
+
+    The iteration at a is done exactly (a plain perturbation step, wherever |Z_a| is); the
+    skip covers a+1 .. b-1 and lands on b, where the kernel checks escape and rebasing.
+    Segments are cut at the near-zero points ("dips") of the orbit, the deepest dips first:
+    nested minibrots make the orbit pass close to 0 at every multiple of each period, and a
+    pixel near them must either rebase or cross such a point with an exact step.  Between
+    dips, segments are halved down to blocks of 2^leaf_log2 iterations.  Sibling segments
+    are paired into a binary tree.
+
+    Stored skips are ordered by (a, length): the skips that start at the same iteration form
+    a contiguous "chain", shortest first.  first[m] is the index of the shortest skip that
+    starts at m (-1: none), last[k] marks the longest of its chain.  The structure depends
+    on the reference only (not on the pixel spacing or the tolerance), so the kernels can
+    keep `first` next to the reference values."""
+    leaf_log2: int
+    length: int                  # L (reference length)
+    a: np.ndarray                # int64 [items]  segment start
+    b: np.ndarray                # int64 [items]  segment end (exclusive)
+    n_leaves: int                # items 0 .. n_leaves-1 are the blocks (no children)
+    rounds: list                 # [(new, left, right)] item ids: new = left followed by right
+    stored: np.ndarray           # int64 [nodes] item ids of the stored skips, in chain order
+    last: np.ndarray             # bool  [nodes]
+    first: np.ndarray            # int32 [L]
+
+    min_skip: int = MIN_SKIP
+    n_nodes: int = -1            # (kept when the arrays above are dropped, see __getstate__)
+    full: bool = True            # False: only `first` (and the counts) - enough for the kernels
+
+    @property
+    def nodes(self) -> int:
+        return int(self.stored.shape[0]) if self.full else int(self.n_nodes)
+
+    @property
+    def signature(self) -> tuple:
+        """Equal for equal structures of the same orbit (tables and uploads must agree)."""
+        return (self.length, self.leaf_log2, self.min_skip, self.nodes)
+
+    def __getstate__(self):
+        # sent between processes without the tree (the receiver uploads `first` with the
+        # reference; a table built there makes the structure again, deterministically)
+        d = dict(self.__dict__)
+        d["n_nodes"] = self.nodes
+        z = np.zeros(0, np.int64)
+        d.update(a=z, b=z, rounds=[], stored=z, last=np.zeros(0, bool), full=False)
+        return d
+
+
+def la_structure(zm: np.ndarray, ze: np.ndarray, leaf_log2: int | None = None,
+                 tau: float = LA_TAU, delta: float = LA_DELTA, min_skip: int = MIN_SKIP) -> LAStructure:
+    """The skip tree of a reference (see LAStructure).  O(L) numpy work."""
+    leaf_log2 = DEFAULT_LEAF_LOG2 if leaf_log2 is None else int(leaf_log2)
+    L = int(zm.shape[0])
+    E = L - 1                                  # skips land at most on the last stored value
+    z64 = np.zeros(0, np.int64)
+    if E < 2:
+        return LAStructure(leaf_log2, L, z64, z64.copy(), 0, [], z64.copy(), np.zeros(0, bool),
+                           np.full(L, -1, np.int32), min_skip=int(min_skip))
+    lz = fe_log2abs(zm[:E + 1], ze[:E + 1].astype(np.int64))
+    with np.errstate(invalid="ignore", over="ignore"):
+        cls = np.floor((tau - lz) / delta) + 1.0
+    q = np.where(lz < tau, np.minimum(cls, 4096.0), 0.0).astype(np.int64)
+    q[0] = _TOP
+    q[E] = _TOP
+    leaf = 1 << leaf_log2
+    seg_a_list, seg_b_list, rounds = [], [], []
+    count = [0]
+
+    def add(a, b):
+        ids = np.arange(count[0], count[0] + a.shape[0], dtype=np.int64)
+        count[0] += a.shape[0]
+        seg_a_list.append(a)
+        seg_b_list.append(b)
+        return ids
+
+    def group(cid, ca, cb, pid, npar):
+        """Pair consecutive children of the same parent (pid sorted) until one item is left
+        per parent; returns that item per parent."""
+        while cid.shape[0]:
+            n = cid.shape[0]
+            newpar = np.ones(n, bool)
+            newpar[1:] = pid[1:] != pid[:-1]
+            if newpar.all():
+                break
+            starts = np.nonzero(newpar)[0]
+            rank = np.arange(n) - np.repeat(starts, np.diff(np.append(starts, n)))
+            even = (rank & 1) == 0
+            nxt = np.zeros(n, bool)
+            nxt[:-1] = ~newpar[1:]
+            pair = even & nxt
+            li = np.nonzero(pair)[0]
+            ri = li + 1
+            new = add(ca[li], cb[ri])
+            rounds.append((new, cid[li], cid[ri]))
+            keep = np.nonzero(even)[0]
+            pk = pair[keep]
+            cid2 = cid[keep].copy()
+            cb2 = cb[keep].copy()
+            cid2[pk] = new
+            cb2[pk] = cb[ri]
+            cid, ca, cb, pid = cid2, ca[keep], cb2, pid[keep]
+        top = np.full(npar, -1, np.int64)
+        top[pid] = cid
+        return top
+
+    # finest segments: between consecutive dips; blocks of `leaf` iterations inside them
+    bnd = np.nonzero(q >= 1)[0]
+    sa, sb = bnd[:-1], bnd[1:]
+    nblk = (sb - sa + leaf - 1) // leaf
+    seg = np.repeat(np.arange(sa.shape[0]), nblk)
+    off = np.arange(seg.shape[0]) - np.repeat(np.cumsum(nblk) - nblk, nblk)
+    ba = sa[seg] + off * leaf
+    bb = np.minimum(ba + leaf, sb[seg])
+    leaf_ids = add(ba, bb)
+    n_leaves = int(ba.shape[0])
+    top = group(leaf_ids, ba, bb, seg, sa.shape[0])
+    # coarser and coarser: the segments between dips of class >= v are the children of the
+    # segments between dips of the next class
+    inner = q[1:E]
+    classes = np.unique(inner[inner >= 1])
+    cur_a, cur_b = sa, sb
+    for v in list(classes[1:]) + [_TOP]:
+        pb = np.nonzero(q >= v)[0]
+        pid = np.searchsorted(pb, cur_a, side="right") - 1
+        top = group(top, cur_a, cur_b, pid, pb.shape[0] - 1)
+        cur_a, cur_b = pb[:-1], pb[1:]
+    a = np.concatenate(seg_a_list)
+    b = np.concatenate(seg_b_list)
+    idx = np.nonzero(b - a - 1 >= max(int(min_skip), 1))[0]
+    stored = idx[np.lexsort((b[idx], a[idx]))]
+    s_a = a[stored]
+    head = np.ones(stored.shape[0], bool)
+    head[1:] = s_a[1:] != s_a[:-1]
+    last = np.ones(stored.shape[0], bool)
+    last[:-1] = head[1:]
+    first = np.full(L, -1, np.int32)
+    first[s_a[head] + 1] = np.nonzero(head)[0].astype(np.int32)
+    return LAStructure(leaf_log2, L, a, b, n_leaves, rounds, stored, last, first, min_skip=int(min_skip))
+
+
+def structure_for(ref, leaf_log2: int | None = None, full: bool = True) -> LAStructure:
+    """The skip structure of a ReferenceOrbit (cached on it: the kernels keep its `first`
+    index next to the reference values, and every table for the orbit must use it).
+    leaf_log2 None: the cached one's (else the default).  full=False: a structure that came
+    from another process (only `first`) will do."""
+    st = getattr(ref, "la", None)
+    if leaf_log2 is None:
+        leaf_log2 = st.leaf_log2 if st is not None else DEFAULT_LEAF_LOG2
+    leaf_log2 = int(leaf_log2)
+    if (st is None or st.length != ref.length or st.leaf_log2 != leaf_log2
+            or (full and not st.full)):
+        st = la_structure(ref.zm, ref.ze, leaf_log2, min_skip=st.min_skip if st is not None else MIN_SKIP)
+        try:
+            ref.la = st
+        except AttributeError:
+            pass
+    return st
+
+
+# ---------------------------------------------------------------------------
+# coefficients
+# ---------------------------------------------------------------------------
+
 @dataclass
 class BLATable:
-    Am: np.ndarray      # complex128, concatenated stored levels
-    Ae: np.ndarray      # int32
+    """Stored skips in chain order (LAStructure): skip k starts at the iteration after its
+    segment start and covers steps[k] iterations: z' = A z + B c (+ C z^2 + D z c + E c^2),
+    valid while |z| < 2^logR[k]."""
+    Am: np.ndarray      # complex128 mantissas, int32 exponents (floatexp)
+    Ae: np.ndarray
     Bm: np.ndarray
     Be: np.ndarray
-    logR: np.ndarray    # float64 (NEG_INF for invalid)
-    lev0: int           # lowest stored level
-    levels: int         # number of levels (highest index + 1)
-    offsets: list       # per level (index = level), offset into arrays (only for stored levels)
-    counts: list        # per level count
+    logR: np.ndarray    # float64 (NEG_INF: never valid)
+    steps: np.ndarray   # int64 skip lengths
+    start: np.ndarray   # int64 iteration each skip starts at (the one after its segment start)
+    last: np.ndarray    # bool: the longest skip of its chain
+    first: np.ndarray   # int32 [L]: shortest skip starting at iteration m (-1: none)
+    lev0: int           # log2 of the block length between dips (LAStructure.leaf_log2)
+    length: int         # reference length the table was made for
+    signature: tuple    # LAStructure.signature of the structure it was made with
     log2_cmax: float
     log2_eps: float
     ref_id: int = 0
@@ -111,41 +299,14 @@ class BLATable:
     def size(self) -> int:
         return int(self.Am.shape[0])
 
-
-# lowest stored level per order (shortest skip = 2**lev0 iterations).  A skip costs a table
-# lookup and breaks the fast run of plain iterations, so short skips do not pay: on an RTX 5060 Ti
-# (bench --bla, period-6006 / 153231 minibrots) second order took 1585 / 899 ms at 2**2,
-# 957 / 781 ms at 2**4 and 801 / 686 ms at 2**6; first order 1351 / 1772 ms at 2**2 and
-# 865 / 931 ms at 2**4.  The software renderer agrees.
-DEFAULT_LEV0 = {1: 4, 2: 7}         # RTX 5060 Ti bench: 2^7 740 ms vs 2^6 819 ms (p6006), equal elsewhere
-DEFAULT_ORDER = 2
-# ... but only for high iteration limits.  The RTX bench of 1.0.0 (1920x1080, ms per picture,
-# 2^6 / 2^7): spiral 10^100 (5,000 iterations) 5.0 / 7.0, 10^1000 (20,000) 5.6 / 6.9,
-# seahorse 10^12 (20,000) 36.9 / 37.1, minibrots p6006 (120,120) 761 / 688 and p153231
-# (3 million) 761 / 749.  Below this limit the second-order table starts at 2^6.
-LEV0_DEEP_ITER = 65536
+    @property
+    def max_logR(self) -> float:
+        """Largest radius: no lookup can succeed for deltas above it."""
+        return float(np.max(self.logR)) if self.size else NEG_INF
 
 
-def default_lev0(order: int, max_iter: int = 0) -> int:
-    """Shortest stored skip (2**lev0) for a reference computed for `max_iter` iterations
-    (0: unknown, the default of the order)."""
-    if order == 2 and 0 < max_iter < LEV0_DEEP_ITER:
-        return 6
-    return DEFAULT_LEV0.get(order, 2)
-
-
-FAST_LEVELS = 6            # levels 1..6 (skips of up to 64 iterations) can be merged in complex128:
-FAST_ZE = (-11, 9)         # with 2**-12 <= |Z| < 2**9 every product stays far inside float64
-                           # (|A| <= 2**640, |C|, |D|, |E| <= 2**1000; terms that underflow are
-                           # below the rounding of the sums they belong to)
-
-
-def _merge_fe(cur, q: bool, log2_cmax: float):
-    """One merge level in floatexp (x = even, y = odd neighbours)."""
-    cnt = cur[0].shape[0]
-    h = cnt // 2
-    x = [arr[0:2 * h:2] for arr in cur]
-    y = [arr[1:2 * h:2] for arr in cur]
+def _compose_fe(x, y, q: bool, log2_cmax: float):
+    """x followed by y, in floatexp (tuples as produced by _single_fe)."""
     xA, xAe, xB, xBe, xR = x[:5]
     yA, yAe, yB, yBe, yR = y[:5]
     nA, nAe = fe_mul(yA, yAe, xA, xAe)
@@ -205,12 +366,8 @@ def _log2abs_c(v):
         return np.log2(np.abs(v))
 
 
-def _merge_c(cur, q: bool, log2_cmax: float):
-    """One merge level in plain complex128 - the same formulas, ~7x fewer numpy passes."""
-    cnt = cur[0].shape[0]
-    h = cnt // 2
-    x = [arr[0:2 * h:2] for arr in cur]
-    y = [arr[1:2 * h:2] for arr in cur]
+def _compose_c(x, y, q: bool, log2_cmax: float):
+    """x followed by y in plain complex128 - the same formulas, ~7x fewer numpy passes."""
     xA, xB, xR = x[:3]
     yA, yB, yR = y[:3]
     nA = yA * xA
@@ -227,129 +384,202 @@ def _merge_c(cur, q: bool, log2_cmax: float):
     return (nA, nB, np.minimum(xR, _radius1(yR, lxA, lxB, log2_cmax)))
 
 
-def _level0(zm1, ze1, log2_cmax: float, log2_eps: float, q: bool):
-    """Single-step BLAs (floatexp): A = 2Z, B = 1 (C = 1, D = E = 0)."""
-    n0 = zm1.shape[0]
-    Am, Ae = fe_norm(2.0 * zm1, ze1)
-    Bm = np.ones(n0, dtype=np.complex128) * 0.5
-    Be = np.ones(n0, dtype=np.int64)          # 1 = 0.5 * 2^1
-    lz = fe_log2abs(zm1, ze1)
+def _single_radius(zm, ze, log2_cmax: float, log2_eps: float, q: bool):
     # first order: |z|^2 < eps |2 Z z|; second order: the dropped third-order terms are
-    # ~ |z|/|Z| smaller than the kept quadratic ones -> sqrt(eps)
-    a = (0.5 * log2_eps if q else log2_eps) + lz
-    b = log2_cmax - 1.0 - lz                  # |c| / |2Z|
-    logR = _log2_sub(a, b)
+    # ~ |z|/|Z| smaller than the kept quadratic ones -> sqrt(eps).  Minus |c| / |2Z|.
+    lz = fe_log2abs(zm, ze)
+    return _log2_sub((0.5 * log2_eps if q else log2_eps) + lz, log2_cmax - 1.0 - lz)
+
+
+def _single_fe(zm, ze, idx, log2_cmax, log2_eps, q):
+    """One iteration at the indices idx (floatexp): A = 2Z, B = 1 (C = 1, D = E = 0)."""
+    n = idx.shape[0]
+    m = zm[idx]
+    e = ze[idx].astype(np.int64)
+    Am, Ae = fe_norm(2.0 * m, e)
+    Bm = np.full(n, 0.5 + 0j)
+    Be = np.ones(n, np.int64)                  # 1 = 0.5 * 2^1
+    R = _single_radius(m, e, log2_cmax, log2_eps, q)
     if q:
-        zero_m = np.zeros(n0, dtype=np.complex128)
-        zero_e = np.full(n0, EXP_ZERO, dtype=np.int64)
-        return (Am, Ae, Bm, Be, logR, Bm.copy(), Be.copy(), zero_m, zero_e, zero_m.copy(), zero_e.copy())
-    return (Am, Ae, Bm, Be, logR)
+        zero_m = np.zeros(n, np.complex128)
+        zero_e = np.full(n, EXP_ZERO, np.int64)
+        return (Am, Ae, Bm, Be, R, Bm.copy(), Be.copy(), zero_m, zero_e, zero_m.copy(), zero_e.copy())
+    return (Am, Ae, Bm, Be, R)
 
 
-def _to_fe(cur_c, q: bool):
-    """complex128 level -> floatexp level."""
+def _identity_fe(n, q):
+    one_m = np.full(n, 0.5 + 0j)
+    one_e = np.ones(n, np.int64)
+    zero_m = np.zeros(n, np.complex128)
+    zero_e = np.full(n, EXP_ZERO, np.int64)
+    out = (one_m, one_e, zero_m, zero_e.copy(), np.full(n, np.inf))
+    if q:
+        out += (zero_m.copy(), zero_e.copy(), zero_m.copy(), zero_e.copy(), zero_m.copy(), zero_e.copy())
+    return out
+
+
+def _c_to_fe(cur_c, q: bool):
+    """complex128 composites -> floatexp."""
     A, B, R = cur_c[:3]
-    out = [*fe_norm(A, np.zeros(A.shape, np.int64)), *fe_norm(B, np.zeros(B.shape, np.int64)), R]
+    z = np.zeros(A.shape, np.int64)
+    out = [*fe_norm(A, z), *fe_norm(B, z), R]
     if q:
         for v in cur_c[3:]:
-            out += [*fe_norm(v, np.zeros(v.shape, np.int64))]
+            out += [*fe_norm(v, z)]
+    return tuple(out)
+
+
+def _take(t, idx):
+    return tuple(v[idx] for v in t)
+
+
+def _put(t, idx, v):
+    for dst, src in zip(t, v):
+        dst[idx] = src
+
+
+def _leaf_rests(zm, ze, la, rl, log2_cmax, log2_eps, q, fast):
+    """Composites of the iterations la+1 .. la+rl (rl >= 1 each), one after another."""
+    n = la.shape[0]
+    ze64 = ze.astype(np.int64)
+    ncomp = 11 if q else 5
+    out = [np.zeros(n, np.complex128) if k in (0, 2, 5, 7, 9) else
+           (np.zeros(n) if k == 4 else np.zeros(n, np.int64)) for k in range(ncomp)]
+    todo = np.ones(n, bool)
+    if fast and n:
+        unsafe = (ze64 < FAST_ZE[0]) | (ze64 > FAST_ZE[1])
+        cs = np.concatenate([[0], np.cumsum(unsafe)])
+        ok = (cs[la + rl + 1] - cs[la + 1]) == 0
+        ok &= rl <= (1 << FAST_LEAF_LOG2)
+        sel = np.nonzero(ok)[0]
+        if sel.shape[0]:
+            sel = sel[np.argsort(-rl[sel], kind="stable")]       # longest first: active = prefix
+            a0, r0 = la[sel], rl[sel]
+            with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+                zc = _ldexp_c(zm, np.clip(ze64, -1100, 1100))
+                R = _single_radius(zm, ze64, log2_cmax, log2_eps, q)
+
+                def single_c(pos):
+                    k = pos.shape[0]
+                    one = np.ones(k, np.complex128)
+                    s = (2.0 * zc[pos], one, R[pos])
+                    if q:
+                        s += (one.copy(), np.zeros(k, np.complex128), np.zeros(k, np.complex128))
+                    return s
+                acc = single_c(a0 + 1)
+                for t in range(1, int(r0[0])):
+                    k = int(np.searchsorted(-r0, -t, side="left"))       # rl > t: a prefix
+                    head = tuple(v[:k] for v in acc)
+                    nxt = _compose_c(head, single_c(a0[:k] + 1 + t), q, log2_cmax)
+                    for v, w in zip(acc, nxt):
+                        v[:k] = w
+                fe = _c_to_fe(acc, q)
+            good = np.ones(sel.shape[0], bool)
+            for v in acc[:2] + acc[3:]:
+                good &= np.isfinite(v)
+            good &= ~np.isnan(acc[2])
+            _put(out, sel[good], _take(fe, np.nonzero(good)[0]))
+            todo[sel[good]] = False
+    sel = np.nonzero(todo)[0]
+    if sel.shape[0]:
+        sel = sel[np.argsort(-rl[sel], kind="stable")]
+        a0, r0 = la[sel], rl[sel]
+        acc = _single_fe(zm, ze, a0 + 1, log2_cmax, log2_eps, q)
+        acc = tuple(np.array(v) for v in acc)
+        for t in range(1, int(r0[0])):
+            k = int(np.searchsorted(-r0, -t, side="left"))
+            head = tuple(v[:k] for v in acc)
+            nxt = _compose_fe(head, _single_fe(zm, ze, a0[:k] + 1 + t, log2_cmax, log2_eps, q), q, log2_cmax)
+            for v, w in zip(acc, nxt):
+                v[:k] = w
+        _put(out, sel, acc)
     return tuple(out)
 
 
 def build_bla(zm: np.ndarray, ze: np.ndarray, log2_cmax: float, log2_eps: float = -24.0,
-              lev0: int | None = None, max_levels: int = 31, order: int | None = None,
-              fast: bool = True, max_iter: int = 0) -> BLATable:
-    """max_iter: the iteration limit the reference is for; it picks the shortest stored
-    skip when `lev0` is not given (default_lev0)."""
-    order = DEFAULT_ORDER if order is None else order
-    lev0 = default_lev0(order, max_iter) if lev0 is None else lev0
-    N = zm.shape[0]
-    n0 = max(N - 2, 0)                       # level 0 entries for m = 1 .. N-2
-    zm1 = zm[1:1 + n0]
-    ze1 = ze[1:1 + n0].astype(np.int64)
+              lev0: int | None = None, order: int | None = None, fast: bool = True,
+              max_iter: int = 0, structure: LAStructure | None = None) -> BLATable:
+    """Skip table of a reference for pixel offsets |c| <= 2^log2_cmax and tolerance 2^log2_eps.
+
+    structure: the reference's LAStructure (made here when not given; lev0 is then its
+    block length, log2).  max_iter is accepted for compatibility (unused)."""
+    order = DEFAULT_ORDER if order is None else int(order)
     q = order == 2
-    cur = _level0(zm1, ze1, log2_cmax, log2_eps, q)
-    stored = []
-    offsets, counts = [], []
-    off = 0
-    j = 0
-    # The short levels below lev0 hold almost all the work (N + N/2 + ...) and are not stored:
-    # compute them in complex128 (the values fit: |Z| <= 256, |A| <= 4**(2**j)).  Entries whose
-    # Z is too small for that (the orbit passing a minibrot's nucleus) are redone in floatexp.
-    nfast = min(lev0, FAST_LEVELS, max_levels - 1) if fast else 0
-    if nfast > 0 and n0 >> nfast >= 1:
-        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            zc = _ldexp_c(zm1, np.clip(ze1, -1100, 1100))
-            ones = np.ones(n0, dtype=np.complex128)
-            cur_c = (2.0 * zc, ones, cur[4]) + ((ones.copy(), np.zeros(n0, np.complex128),
-                                                 np.zeros(n0, np.complex128)) if q else ())
-        unsafe = (ze1 != EXP_ZERO) & ((ze1 < FAST_ZE[0]) | (ze1 > FAST_ZE[1]))
-        lvl0_fe = cur
-        for _ in range(nfast):               # levels 0 .. nfast-1 (not stored: nfast <= lev0)
-            offsets.append(0)
-            counts.append(cur_c[0].shape[0])
-            j += 1
-            with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
-                cur_c = _merge_c(cur_c, q, log2_cmax)
-        cur = _to_fe(cur_c, q)
-        nb = cur[0].shape[0]
-        bad = np.zeros(nb, bool)
-        ub = np.unique(np.nonzero(unsafe)[0] >> j)
-        bad[ub[ub < nb]] = True
-        for v in cur_c[:2] + cur_c[3:]:
-            bad |= ~np.isfinite(v)
-        bad |= np.isnan(cur_c[2])
-        if np.any(bad):
-            # redo the blocks with a tiny / huge Z (or anything non-finite) in floatexp
-            blocks = np.nonzero(bad)[0]
-            idx = (blocks[:, None] * (1 << j) + np.arange(1 << j)[None, :]).ravel()
-            sub = tuple(a[idx] for a in lvl0_fe)
-            for _ in range(j):
-                sub = _merge_fe(sub, q, log2_cmax)
-            cur = tuple(a.copy() for a in cur)
-            for a, b in zip(cur, sub):
-                a[blocks] = b
-    while True:
-        cnt = cur[0].shape[0]
-        if cnt == 0:
-            break
-        if j >= lev0:
-            stored.append(cur)
-            offsets.append(off)
-            counts.append(cnt)
-            off += cnt
-        else:
-            offsets.append(0)
-            counts.append(cnt)
-        j += 1
-        if j >= max_levels or cnt < 2:
-            break
-        cur = _merge_fe(cur, q, log2_cmax)
-    return _finish(stored, offsets, counts, lev0, j, log2_cmax, log2_eps, order, q)
-
-
-def _finish(stored, offsets, counts, lev0, levels, log2_cmax, log2_eps, order, q) -> BLATable:
-    def cat(k, dtype):
-        return np.concatenate([c[k] for c in stored]) if stored else np.zeros(0, dtype)
-    A, Ae_, B, Be_, R = (cat(0, np.complex128), cat(1, np.int64), cat(2, np.complex128), cat(3, np.int64),
-                         cat(4, np.float64))
-    R = np.where(np.isfinite(R), R, NEG_INF)
+    st = structure if structure is not None else la_structure(zm, ze, lev0)
+    L = int(zm.shape[0])
+    if st.length != L or not st.full:
+        st = la_structure(zm, ze, st.leaf_log2, min_skip=st.min_skip)
+    log2_cmax = float(log2_cmax)
+    log2_eps = float(log2_eps)
+    nitems = st.a.shape[0]
+    empty_c = np.zeros(0, np.complex128)
+    empty_i = np.zeros(0, np.int32)
+    if st.nodes == 0:
+        t = BLATable(Am=empty_c, Ae=empty_i, Bm=empty_c.copy(), Be=empty_i.copy(), logR=np.zeros(0),
+                     steps=np.zeros(0, np.int64), start=np.zeros(0, np.int64), last=np.zeros(0, bool),
+                     first=st.first, lev0=st.leaf_log2,
+                     length=L, signature=st.signature, log2_cmax=log2_cmax, log2_eps=log2_eps, order=order)
+        if q:
+            t.Cm, t.Ce, t.Dm, t.De, t.Em, t.Ee = empty_c, empty_i, empty_c, empty_i, empty_c, empty_i
+        return t
+    # per item: `rest` (iterations a+1 .. b-1) and `full` (a .. b-1)
+    rest = _identity_fe(nitems, q)
+    rest = tuple(np.array(v) for v in rest)
+    has_rest = np.zeros(nitems, bool)
+    full = tuple(np.array(v) for v in _identity_fe(nitems, q))
+    nl = st.n_leaves
+    la, lb = st.a[:nl], st.b[:nl]
+    rl = lb - la - 1
+    sel = np.nonzero(rl >= 1)[0]
+    if sel.shape[0]:
+        _put(rest, sel, _leaf_rests(zm, ze, la[sel], rl[sel], log2_cmax, log2_eps, q, fast))
+        has_rest[sel] = True
+    ids = np.arange(nl)
+    s0 = _single_fe(zm, ze, la, log2_cmax, log2_eps, q)
+    f = _compose_fe(s0, _take(rest, ids), q, log2_cmax)
+    nr = ~has_rest[:nl]
+    if np.any(nr):
+        f = tuple(np.where(nr, a, b) for a, b in zip(s0, f))
+    _put(full, ids, f)
+    for new, left, right in st.rounds:
+        x = _take(rest, left)
+        y = _take(full, right)
+        r = _compose_fe(x, y, q, log2_cmax)
+        nx = ~has_rest[left]
+        if np.any(nx):
+            r = tuple(np.where(nx, b, a) for a, b in zip(r, y))
+        _put(rest, new, r)
+        has_rest[new] = True
+        _put(full, new, _compose_fe(_take(full, left), y, q, log2_cmax))
+    k = st.stored
+    R = rest[4][k]
+    R = np.where(np.isfinite(R) | (R == np.inf), R, NEG_INF)
+    R = np.minimum(R, 1e30)
 
     def clip32(e):
         return np.where(e == EXP_ZERO, EXP_ZERO, np.clip(e, -(1 << 30), 1 << 30)).astype(np.int32)
-    t = BLATable(Am=A, Ae=clip32(Ae_), Bm=B, Be=clip32(Be_), logR=R, lev0=lev0, levels=levels,
-                 offsets=offsets, counts=counts, log2_cmax=log2_cmax, log2_eps=log2_eps, order=order)
+    t = BLATable(Am=rest[0][k], Ae=clip32(rest[1][k]), Bm=rest[2][k], Be=clip32(rest[3][k]), logR=R,
+                 steps=(st.b[k] - st.a[k] - 1).astype(np.int64), start=(st.a[k] + 1).astype(np.int64),
+                 last=st.last, first=st.first,
+                 lev0=st.leaf_log2, length=L, signature=st.signature, log2_cmax=log2_cmax,
+                 log2_eps=log2_eps, order=order)
     if q:
-        t.Cm, t.Ce = cat(5, np.complex128), clip32(cat(6, np.int64))
-        t.Dm, t.De = cat(7, np.complex128), clip32(cat(8, np.int64))
-        t.Em, t.Ee = cat(9, np.complex128), clip32(cat(10, np.int64))
+        t.Cm, t.Ce = rest[5][k], clip32(rest[6][k])
+        t.Dm, t.De = rest[7][k], clip32(rest[8][k])
+        t.Em, t.Ee = rest[9][k], clip32(rest[10][k])
     return t
 
 
-def apply_reference_check(bla: BLATable, level: int, m: int):
-    """Return (A, B, logR) as python complex/float values for testing."""
-    i = (m - 1) >> level
-    k = bla.offsets[level] + i
-    A = complex(bla.Am[k]) * 2.0 ** int(bla.Ae[k])
-    B = complex(bla.Bm[k]) * 2.0 ** int(bla.Be[k])
-    return A, B, float(bla.logR[k])
+def skip_at(bla: BLATable, m: int, logw: float, budget: int | None = None):
+    """The longest stored skip starting at iteration m that is valid for log2|z| = logw
+    (and at most `budget` iterations long): its index, or -1 (the kernels' lookup)."""
+    k = int(bla.first[m]) if 0 <= m < bla.first.shape[0] else -1
+    best = -1
+    while k >= 0:
+        if not (logw < bla.logR[k]) or (budget is not None and bla.steps[k] > budget):
+            break
+        best = k
+        if bla.last[k]:
+            break
+        k += 1
+    return best

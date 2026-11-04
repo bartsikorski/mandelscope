@@ -566,17 +566,77 @@ pixel unchanged; reference orbits +16-20 ms where a candidate is checked and rej
 confirmed (seahorse 10^12: a period-8007 near miss, 24 -> 44 ms; period-6006 minibrot 37 ->
 53 ms).
 
+**v3.15 (November 2026: skips across the near-zero points of nested minibrots).**  After v3.14
+the user still saw zooms lag at nested minibrots (10^17.18 near -1.576, 251,889 iterations).
+Measured at a place of the same kind, nested minibrots near the Feigenbaum point (10^17.8,
+259,807 iterations; now the built-in place `nested_minibrots`): 38,500 GPU steps per pixel.
+The cause was not the reference this time but the skips.  They were blocks of 2^j iterations
+aligned to iteration 1, and a skip is valid only while the pixel's delta stays small against
+|Z| over all its iterations (its radius is the smallest over them).  Near nested minibrots the
+reference passes close to 0 at every multiple of each nested period (here 16, 32, 128, 2560 and
+38400), so every block that contained such a point had a radius far below the pixels' deltas,
+and the pixels did most of their iterations in plain steps.
+
+The skip tree (`bla.la_structure`; cutting at those points is the idea behind Zhuoran's "LA with
+stages", derived here from the composition rules above, the AGPL code was not used):
+- Iteration m is a near-zero point ("dip") of class 1 + floor((-3 - log2|Z_m|) / 2) when
+  |Z_m| < 2^-3 (class 0 otherwise); the two ends of the reference get the highest class.
+- The finest segments run from one dip to the next and are cut into blocks of 2^5 iterations.
+  Each coarser level joins the segments between the dips of the next class: the segments
+  between dips of class >= v are the children of those between dips of the next class above
+  v.  Children of one parent are paired by rank into a binary tree.
+- A segment [a, b) does the iteration at a as a plain, exact perturbation step (at a dip the
+  delta can be larger than |Z_a|, which no skip covers) and the skip covers a+1 .. b-1, landing
+  on b, where the kernel checks escape and rebasing as after any step.  Skips are composed as
+  before (second order, floatexp, plain float64 for blocks whose terms fit): rest(new) =
+  rest(left) o full(right), full(new) = full(left) o full(right).
+- Lookup: the skips that start at the same iteration form a chain, shortest first.  The index
+  of the shortest is uploaded as the reference value's fourth component (`first`), so finding
+  it costs no extra memory read; the kernel walks up the chain while the next skip's radius
+  holds and stops at the first that fails or at the chain's end (flag bit in `len`).  A table
+  and a reference upload carry the structure's signature (length, block size, shortest skip,
+  nodes) and are used together only when they match.
+- Skips of fewer than 16 iterations are not stored: a skip costs about 30-40 plain steps on
+  the software renderer, and with them the Feigenbaum place took 2,017 steps per pixel (340
+  skips, 30 failed lookups) in 1.04 s against 3,723 (137, 8) in 0.67 s.  Blocks of 2^4 and 2^6
+  were equal there; `bench --bla` compares block size and shortest skip on the user's GPU.
+- The dispatch budget counts a skip as 32 steps and a step with a failed lookup as 3, so a
+  time slice full of skips no longer takes several times longer than its step count says.
+
+Software renderer, 320x180, float32 (GPU seconds; steps / skips per pixel):
+
+| place (iteration limit) | main (v3.14) | skip tree |
+|---|---|---|
+| nested minibrots 10^17.8 (259,807) | 3.95 (38,501 / 321) | 0.83 (3,723 / 137) |
+| minibrot p6006 (120,120) | 2.77 (28,276 / 0) | 2.39 (6,866 / 608) |
+| minibrot p153231 (3 million) | 1.20 (13,476 / 23) | 0.65 (1,679 / 308) |
+| seahorse 10^12 (20,000) | 0.17 (1,536 / 2) | 0.09 (405 / 27) |
+| spiral 10^100 (5,000) | 0.03 (178 / 2) | 0.02 (55 / 3) |
+| 10^1000 (20,000) | 0.04 (177 / 5) | 0.02 (63 / 6) |
+
+Building a table takes 0.01-0.18 s instead of 0.00-0.09 s (more skips; still far below the
+reference orbits).  At the period-6006 minibrot, where the skips of v3.14 almost never held,
+the new ones replace three quarters of the steps but each costs ~30 plain ones on the software
+renderer, so the time barely moves there; on a GPU the ratio decides, which is what the RTX
+`bench --bla` is for.  Escape counts against plain perturbation (160x90): the 1/10/50/90 %
+percentiles agree to 0.5 % at both minibrots, the 99 % ones to 0.2 % (p153231) and 2.7 %
+(p6006, 144 pixels, chaotic).
+
+The test `test_nested_minibrots_skip_their_near_zero_points` renders the place with and without
+skips: fewer than 6,000 steps per pixel with them, the escape counts' 10/50/90 % percentiles
+within 2 % of the plain picture (the counts are chaotic there: float32 rounding alone changes
+most of them).  `test_bla_skips_match_perturbation` checks random stored skips against plain
+perturbation and `test_skips_are_cut_at_near_zero_points` the cuts.
+
 ## 6. Possible next steps
 
 * BLA for the Burning Ship (skips are valid only while the deltas change no signs).
 * Make float-float or float64 the precise mode by default per GPU, from the bench.
 * Multi-threaded or GPU reference orbits for > 10 000 decimal digits (mandelbrot-webgpu
   computes them in WGSL with fixed-point limbs; ours take 3-490 ms for the built-in places).
-* Imagina-style "LA with stages" (Zhuoran): approximations that also cover the rebases at
-  the near-periods of the reference, so pixels that have left the reference near a deep
-  minibrot keep skipping.  Second-order BLA already took the steps per pixel near the
-  period-153231 minibrot from ~9,300 to ~2,200; the published description of LA is forum
-  posts and AGPL code, so it needs a clean derivation first.
+* The rest of "LA with stages": v3.15 cuts the skips at the reference's near-zero points;
+  approximations that also carry a pixel across a rebase (the pixel restarts at iteration 0
+  and climbs the chains again) would remove the plain steps that remain right after rebases.
 * Cheaper BLA skips.  With the skip counts that `bench --bla` now prints (software renderer,
   320x180, period-6006 minibrot): second order at 2^4 takes 16,141 steps incl. 704 skips per
   pixel in 15.7 s, at 2^6 27,953 steps incl. 5 skips in 13.6 s - a skip costs about as much as 24

@@ -34,7 +34,7 @@ def render_view(engine, view: View, W: int, H: int, double=False, use_bla=True, 
     t_gpu = time.perf_counter() - t
     res = f.read_results()
     info = dict(ref_len=ref.length, ref_escaped=ref.escaped, period=ref.period, t_ref=t_ref,
-                t_bla=t_bla, bla_size=bla.size if bla else 0, bla_levels=bla.levels if bla else 0,
+                t_bla=t_bla, bla_size=bla.size if bla else 0, bla_levels=1 if bla and bla.size else 0,
                 t_gpu=t_gpu, complete=ok,
                 dispatches=f.dispatches, bla_skips=f.bla_skips, rebases=f.rebases, steps=f.steps)
     f.release()

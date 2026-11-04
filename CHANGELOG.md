@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Speed
+- **Skips across the near-zero points of nested minibrots.** Deep inside minibrots nested in minibrots, every pixel's orbit passes close to 0 at each multiple of each nested period (16, 32, 128, 2560, 38400 near the Feigenbaum point). The skips of 2^j iterations from iteration 1 could not reach past those points, so zooming there fell back to plain steps and lagged. The skips now form a tree cut at those points, deepest first, with blocks of 32 iterations in between: each skip ends right before a near-zero point, where the next one starts. At the new place *Nested minibrots near the Feigenbaum point* (10^17.8, 260,000 iterations) a picture takes 3,700 GPU steps per pixel instead of 38,500 (4.8× faster in CPU mode), and the period-153231 minibrot 1,700 instead of 13,500 (1.8× faster); the other places stay as fast or get faster. `bench --bla` compares the block size and the shortest stored skip.
+
 ### Fixed
 - **Minibrots inside minibrots**: a reference orbit at (or inside) a minibrot nested in another one could take the outer minibrot's cycle for its own, e.g. period 150 instead of 600, and repeat it. Every pixel past that point was then computed against a wrong orbit: solid "inside" patches, wrong colours and extra rebasing near nested minibrots. Each cycle the float64 test finds is now confirmed in full precision with Newton's method (the periodic point must exist on the orbit and its cycle must attract). The shortcut now also finds weakly attracting cycles and the basic period instead of a multiple, so references off a minibrot's nucleus stay short; frame times on an RTX 5060 Ti are unchanged (`bench --bla`).
 
