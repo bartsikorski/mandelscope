@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+- **Fixed auto colours for videos** (Export panel checkbox, `mandelscope video --fixed-auto`). The 'auto' mapping normally builds its colour table from each frame on its own, so while zooming a point keeps changing colour as new detail comes into view. With this option a quick low-resolution pass over (up to 120 of) the video's frames builds one table for the whole video: a point's colour then depends only on its iteration count, so the zoom looks like flying into one solid object. The palette repeats are scaled so a typical frame still shows about 'cycles' of them, and minibrots no longer blur into dark halos. The pass adds a few seconds (about 8 s for a 251,889-iteration zoom to 10^-17 on an RTX 5060 Ti).
+- **L locks the 'auto' colours** in the explorer (also a checkbox under the mapping): the current table stays while you zoom, until you press L again. Far past the depth it was made at, the picture runs off the end of the table and turns flat.
+
 ### Fixed
 - **Minibrots inside minibrots**: a reference orbit at (or inside) a minibrot nested in another one could take the outer minibrot's cycle for its own, e.g. period 150 instead of 600, and repeat it. Every pixel past that point was then computed against a wrong orbit: solid "inside" patches, wrong colours and extra rebasing near nested minibrots. Each cycle the float64 test finds is now confirmed in full precision with Newton's method (the periodic point must exist on the orbit and its cycle must attract). The shortcut now also finds weakly attracting cycles and the basic period instead of a multiple, so references off a minibrot's nucleus stay short; frame times on an RTX 5060 Ti are unchanged (`bench --bla`).
 

@@ -1615,6 +1615,72 @@ class AutoContrast:
         self.tex.write(cdf.astype(np.float32).tobytes())
 
 
+def fixed_auto_table(samples: list, bins: int = 16384, lin: float = 0.02):
+    """One 'auto' colour mapping for a whole video, from low-resolution samples of its frames.
+
+    ``samples``: per sampled frame, an array of log2(smooth iterations) of its escaped samples.
+    Every frame counts equally (a frame that is mostly interior is not outweighed by one that is
+    all detail).  Returns (lo, hi, cdf, scale) or None: the CDF over [lo, hi] (``bins`` texels, a
+    pure function of the iteration count, so a point keeps its colour from frame to frame), and
+    ``scale``: by how much to multiply auto_cycles so that a typical frame still shows about
+    auto_cycles palette repetitions (median over the frames of the CDF span between their 2nd
+    and 98th percentiles - a frame of a long zoom covers only a small part of the table)."""
+    xs = [np.asarray(x, dtype=np.float64) for x in samples]
+    xs = [x[np.isfinite(x)] for x in xs]
+    xs = [x for x in xs if x.size]
+    if not xs:
+        return None
+    lo = min(float(x.min()) for x in xs)
+    hi = max(float(x.max()) for x in xs)
+    if hi - lo < 1e-3:
+        hi = lo + 1e-3
+    h = np.zeros(bins, dtype=np.float64)
+    for x in xs:
+        k = np.clip(((x - lo) / (hi - lo) * bins).astype(np.int64), 0, bins - 1)
+        h += np.bincount(k, minlength=bins) / x.size
+    # texel j holds the share of samples below lo + j (hi - lo) / (bins - 1), as in AutoContrast
+    edges = np.linspace(lo, hi, bins + 1)
+    cum = np.concatenate([[0.0], np.cumsum(h)])
+    pos = np.linspace(lo, hi, bins)
+    raw = np.interp(pos, edges, cum)
+    dens = np.diff(np.concatenate([[raw[0]], raw]))
+    dens = np.maximum(dens, 0) + lin * dens.sum() / bins
+    cdf = np.cumsum(dens)
+    cdf = (cdf - cdf[0]) / max(cdf[-1] - cdf[0], 1e-12)
+    spans = []
+    for x in xs:
+        p2, p98 = np.percentile(x, [2, 98])
+        s = float(np.interp(p98, pos, cdf) - np.interp(p2, pos, cdf))
+        spans.append(s)
+    med = float(np.median(spans))
+    scale = 1.0 / max(med, 1e-4) if med > 0 else 1.0
+    return lo, hi, cdf, max(1.0, scale)
+
+
+class FixedAuto:
+    """The 'auto' mapping frozen for a whole video (see fixed_auto_table); used by Display.render
+    like AutoContrast (``tex``, ``lo``, ``hi``, ``valid``)."""
+
+    def __init__(self, ctx: moderngl.Context, lo: float, hi: float, cdf: np.ndarray, scale: float):
+        self.lo, self.hi, self.cdf, self.scale = float(lo), float(hi), cdf, float(scale)
+        n = min(len(cdf), int(ctx.info.get("GL_MAX_TEXTURE_SIZE", 16384)))
+        if n < len(cdf):
+            cdf = np.interp(np.linspace(0, 1, n), np.linspace(0, 1, len(cdf)), cdf)
+        self.tex = ctx.texture((n, 1), 1, dtype="f4")
+        self.tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.tex.repeat_x = False
+        self.tex.repeat_y = False
+        self.tex.write(np.asarray(cdf, dtype=np.float32).tobytes())
+        self.valid = True
+
+    def colours(self, cs: "ColorSettings") -> "ColorSettings":
+        """``cs`` with auto_cycles scaled so a typical frame shows as many bands as with per-frame auto."""
+        return replace(cs, auto_cycles=cs.auto_cycles * self.scale)
+
+    def release(self):
+        self.tex.release()
+
+
 class Display:
     def __init__(self, ctx: moderngl.Context):
         self.ctx = ctx

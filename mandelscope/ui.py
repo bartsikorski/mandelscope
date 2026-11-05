@@ -747,6 +747,9 @@ def _tab_colour(app):
                     "log / sqrt / linear: fixed spacing (set the density)")
         if c.mapping == 3:
             _, c.auto_cycles = imgui.slider_float("cycles", c.auto_cycles, 0.5, 20.0, "%.1f")
+            ch, lk = imgui.checkbox("lock colours (L)", app.auto_locked)
+            if ch:
+                app.toggle_auto_lock()
         else:
             ch, d = imgui.slider_float("density", math.log10(max(c.density, 1e-6)), -4.0, 1.0, "")
             if ch:
@@ -1195,6 +1198,12 @@ def _tab_export(app):
                           "and colour keyframes stay per frame.  Typically 5-15x fewer samples;\n"
                           "very fast moves fall back to computing frames one by one.\n"
                           "Needs ~3 GB of graphics memory at 1080p with 2x2.")
+    _, s.video_fixed_auto = imgui.checkbox("fixed auto colours (no colour drift)", s.video_fixed_auto)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("With the 'auto' mapping: one colour table for the whole video instead of\n"
+                          "one per frame, so every point keeps its colour while you zoom in.\n"
+                          "A quick low-resolution pass over the frames comes first; the palette\n"
+                          "repeats are scaled so a typical frame still shows about 'cycles' of them.")
     if s.video_ss > 1 and not s.fast_movie:
         _, s.adaptive_export = imgui.checkbox("adaptive (experimental)", s.adaptive_export)
         if imgui.is_item_hovered():
@@ -1716,6 +1725,7 @@ SHORTCUTS = [
     ("K", "add keyframe"),
     ("Space", "play / pause the timeline"),
     ("T", "show / hide the timeline"),
+    ("L", "lock / unlock the 'auto' colours (points keep their colours while zooming)"),
     ("R", "start / stop live recording"),
     ("P", "start / stop recording a flight"),
     ("F12", "screenshot (2x supersampled PNG)"),

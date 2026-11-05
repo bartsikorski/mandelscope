@@ -165,3 +165,36 @@ def test_auto_codec_skips_hardware_encoders_for_tiny_frames(monkeypatch):
     assert video.resolve_codec("auto", 1920, 1080) == video.AUTO_ORDER[0]
     assert video.resolve_codec("auto") == video.AUTO_ORDER[0]
     assert video.resolve_codec("hevc_nvenc", 96, 54) == "hevc_nvenc"      # asked for: as given
+
+
+def test_fixed_auto_colours_stay_with_the_point(engine, locations):
+    """RenderSettings.fixed_auto: one 'auto' table for the whole video - the colour of a point
+    depends only on its iteration count (same table, same scaled cycles in every frame), and
+    fast (key picture) and direct frames agree."""
+    from mandelscope.cli import load_location
+    v1, colors = load_location(str(locations / "spiral_1e-100.json"))
+    assert colors.mapping == 3
+    v0 = v1.copy()
+    v0.log2r = v1.log2r + 6.0
+    seq = Sequence([Keyframe(v0, 0.0), Keyframe(v1, 2.0)], fps=8)
+    rs = RenderSettings(width=96, height=54, ss=2, fixed_auto=True)
+    st = [f for f in render_sequence_iter(engine, seq, None, rs, colors, fps=8.0)]
+    assert st[0]["phase"] == "colours"
+    direct = [f["image"] for f in st if f["phase"] == "frame"]
+    assert len(direct) == seq.frame_count(8.0)
+    assert all(img.std() > 5 for img in direct)
+    fast = [f["image"] for f in render_sequence_iter(engine, seq, None, RenderSettings(
+        width=96, height=54, ss=2, fixed_auto=True, fast=True), colors, fps=8.0) if f["phase"] == "frame"]
+    diffs = [np.abs(a.astype(int) - b.astype(int)).mean() for a, b in zip(direct, fast)]
+    assert max(diffs) < 6.0, diffs
+    # the table is a fixed function of the iteration count: two frames colour the same count alike
+    fr = FrameRenderer(engine, rs)
+    times = [i / 8.0 for i in range(seq.frame_count(8.0))]
+    from mandelscope.offline import fixed_auto_prepass
+    from mandelscope.renderer import ColorSettings
+    list(fixed_auto_prepass(fr, seq, times, [colors] * len(times)))
+    assert fr.fixed is not None and fr.fixed.scale >= 1.0
+    cs = fr.fixed.colours(colors)
+    assert cs.auto_cycles == pytest.approx(colors.auto_cycles * fr.fixed.scale)
+    assert isinstance(cs, ColorSettings)
+    fr.release()

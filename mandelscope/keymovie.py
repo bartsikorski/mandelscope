@@ -322,7 +322,7 @@ def render_sequence_fast_iter(engine, seq, path: str, settings, colors: ColorSet
                               frame_range: tuple | None = None, time_slice: float = 0.2,
                               max_samples: int | None = None, stats: dict | None = None, julia=None):
     """Like offline.render_sequence_iter (same yields), with frames cut out of key pictures."""
-    from .offline import FrameRenderer, apply_color_overrides, draw_overlay
+    from .offline import FrameRenderer, apply_color_overrides, draw_overlay, fixed_auto_prepass
     from .video import FfmpegWriter, PngSaver
     ctx = engine.ctx
     fr = FrameRenderer(engine, settings)
@@ -340,6 +340,9 @@ def render_sequence_fast_iter(engine, seq, path: str, settings, colors: ColorSet
     vo = [seq.view_at(t) for t in times]
     views = [v for v, _ in vo]
     css = [apply_color_overrides(colors, o) for _, o in vo]
+    # 'auto' colours frozen for the whole video (optional): one table from low-res frames first
+    for pr in fixed_auto_prepass(fr, seq, times, css, worker=worker, time_slice=time_slice):
+        yield dict(frame=a, frames=n, phase="colours", progress=0.0, eta=0.0, codec=None, prepass=pr)
     max_side = min(16384, int(ctx.info.get("GL_MAX_TEXTURE_SIZE", 16384)))
     plans = plan_key_pictures(views, W, H, q, direct_samples=W * H * q * q,
                               max_samples=max_samples or MAX_SAMPLES, max_side=max_side)
@@ -461,7 +464,9 @@ def render_sequence_fast_iter(engine, seq, path: str, settings, colors: ColorSet
             maps = [None] * n_win
             lo, hi = pic.iter_range()
             auto_k = [k for k in range(n_win) if css[plan.f0 + k].mapping == 3]
-            if auto_k and lo is not None and hi is not None:
+            if fr.fixed is not None:
+                pass                                # one table for all frames (below)
+            elif auto_k and lo is not None and hi is not None:
                 a0 = math.log2(max(lo, 1))
                 a1 = max(math.log2(hi + 1.0), a0 + 1e-3)
                 hb = ctx.buffer(reserve=len(auto_k) * BINS * 4)
@@ -498,7 +503,10 @@ def render_sequence_fast_iter(engine, seq, path: str, settings, colors: ColorSet
                     if inside and abs(A1) >= 0.6 * q:
                         parts.append((prev, A1, D1, (m - k) / (m + 1.0)))
                 auto = None
-                if maps[k] is not None:
+                if fr.fixed is not None and cs.mapping == 3:
+                    auto = fr.fixed
+                    cs = fr.fixed.colours(cs)
+                elif maps[k] is not None:
                     tex = cdf_ring[nframe % 3]
                     tex.write(maps[k][2])
                     auto = SimpleNamespace(tex=tex, lo=maps[k][0], hi=maps[k][1], valid=True)

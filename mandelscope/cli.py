@@ -95,7 +95,8 @@ def cmd_video(args):
     ctx = make_headless_context()
     eng = GPUEngine(ctx)
     rs = RenderSettings(width=w, height=h, ss=args.ss, double=2 if args.ff else args.f64, use_bla=not args.no_bla,
-                        adaptive=args.adaptive and not args.fast, fast=args.fast, iter_mult=max(1, args.iter_mult))
+                        adaptive=args.adaptive and not args.fast, fast=args.fast, iter_mult=max(1, args.iter_mult),
+                        fixed_auto=args.fixed_auto)
     last = 0
     t0 = time.perf_counter()
     for st in render_sequence_iter(eng, seq, args.output, rs, colors, fps, args.codec, args.quality,
@@ -711,6 +712,8 @@ def main(argv=None):
                    help="frames cut out of shared key pictures, >= ss x ss samples per pixel (default; "
                         "--no-fast computes every frame on its own)")
     v.add_argument("--palette", default=None)
+    v.add_argument("--fixed-auto", action="store_true",
+                   help="'auto' colours: one table for the whole video (points keep their colours)")
     v.add_argument("--png-dir", default=None)
     sub.add_parser("info", help="show GPU / encoder information")
     b = sub.add_parser("bench", help="benchmark")
