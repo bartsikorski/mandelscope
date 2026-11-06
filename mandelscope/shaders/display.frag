@@ -43,7 +43,7 @@ uniform float uSlopeStrength;
 uniform vec2  uLightDir;
 uniform float uLightHeight;
 uniform int   uShowFallback;
-uniform sampler2D uAutoTex;  // cumulative distribution of log2(mu), 1024 x 1
+uniform sampler2D uAutoTex;  // cumulative distribution of log2(mu), 1024 x 1 (wider: FixedAuto)
 uniform vec2  uAutoRange;    // log2(mu) range covered by uAutoTex
 uniform float uAutoCycles;
 uniform float uGlow;         // brighten near the set (DE based)
@@ -87,7 +87,8 @@ vec3 colorize(uvec4 a, uvec4 b) {
         else if (uMapping == 2) t = sqrt(mu) * uDensity * 4.0;
         else if (uMapping == 3) {
             float x = (log2(float(a.x) + frac) - uAutoRange.x) / max(uAutoRange.y - uAutoRange.x, 1e-6);
-            t = texture(uAutoTex, vec2(clamp(x, 0.0, 1.0) * (1023.0 / 1024.0) + 0.5 / 1024.0, 0.5)).r * uAutoCycles;
+            float nt = float(textureSize(uAutoTex, 0).x);     // 1024, or more for a whole video
+            t = texture(uAutoTex, vec2(clamp(x, 0.0, 1.0) * ((nt - 1.0) / nt) + 0.5 / nt, 0.5)).r * uAutoCycles;
         }
         else t = mu * uDensity;
     }

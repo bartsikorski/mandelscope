@@ -94,6 +94,7 @@ class Settings:
     video_png: bool = False
     fast_movie: bool = True         # videos: frames cut out of shared key pictures (keymovie.py); v3.4
                                     # bench on the RTX 5060 Ti: 1.4-4.4x faster, same picture
+    video_fixed_auto: bool = False  # videos: one 'auto' colour table for all frames (no colour drift)
     julia_preview: bool = False     # small live Julia set for the point under the cursor (J)
     video_name: str = "mandelscope"
     still_w: int = 3840
@@ -729,6 +730,7 @@ class App:
         self.refs = ReferenceCache(self.engine)
         self.jrefs = JuliaReferences(self.engine)   # deep Julia sets (perturbation, two references)
         self.auto = AutoContrast(self.ctx)
+        self.auto_locked = False    # L: keep the current 'auto' colour table (points keep their colours)
         self.previews = LookPreviews(self)
         self.jpreview = JuliaPreview(self)
         self.ref_worker = Worker()
@@ -1121,6 +1123,8 @@ class App:
                     self.settings.julia_preview = not self.settings.julia_preview
             if "t" in p:
                 self.settings.show_timeline = not self.settings.show_timeline
+            if "l" in p:
+                self.toggle_auto_lock()
             if "tab" in p:
                 self.ui_visible = not self.ui_visible
             if "f1" in p:
@@ -1969,7 +1973,7 @@ class App:
         t_post = time.perf_counter()
         if done and not was_complete:
             self._on_field_complete(moving)
-        elif (not done and self.colors.mapping == 3 and field.level_done <= 3
+        elif (not done and self.colors.mapping == 3 and field.level_done <= 3 and not self.auto_locked
               and getattr(self, "auto_serial", -1) != self.field_serial):
             # 'auto' colours: adapt as soon as the coarse level of a new view is there
             # (otherwise a jump to a very different depth shows one flat colour until done)
@@ -1990,7 +1994,7 @@ class App:
             area = (f.W * f.H) / max(1, self.fb[0] * self.fb[1])     # field samples per screen pixel
             if area > 0.05:
                 self.field_T_full = min(4.0, 0.5 * self.field_T_full + 0.5 * dt / min(1.0, area))
-        if self.colors.mapping == 3:
+        if self.colors.mapping == 3 and not (self.auto_locked and self.auto.valid):
             self.auto.update(f, smooth=0.6 if moving else 0.0)
         self._take_snapshot(min(1.0, (f.W / max(self.fb[0], 1)) ** 2))
         if capped:
@@ -2290,7 +2294,8 @@ class App:
         if ck != self.colors_key:
             self.colors_key = ck
             self.aa_count = 0
-            if self.colors.mapping == 3 and self.field is not None and self.field.complete:
+            if (self.colors.mapping == 3 and self.field is not None and self.field.complete
+                    and not (self.auto_locked and self.auto.valid)):
                 self.auto.update(self.field)
         budget = self.settings.frame_budget_ms / 1000.0
         t1 = time.perf_counter()
@@ -2401,6 +2406,18 @@ class App:
                                            "light_angle", "light_height", "glow", "glow_color", "stripes",
                                            "stripe_freq", "pattern", "pattern_strength", "pattern_freq",
                                            "interior", "look")}
+
+    def toggle_auto_lock(self):
+        """L: freeze / unfreeze the 'auto' colour table.  Frozen, a point keeps its colour while
+        zooming (the table covers the iteration range of the view it was made at: much deeper,
+        the picture runs past its end and turns flat - unlock to adapt again)."""
+        self.auto_locked = not self.auto_locked
+        if not self.auto_locked and self.colors.mapping == 3 and self.field is not None and self.field.complete:
+            self.auto.update(self.field)
+        if self.colors.mapping != 3:
+            self.notify("colour lock: only for the 'auto' mapping")
+        else:
+            self.notify("auto colours locked (L to unlock)" if self.auto_locked else "auto colours follow the view")
 
     def toggle_play(self):
         if len(self.sequence.keyframes) < 2:
@@ -2581,7 +2598,8 @@ class App:
                             double=self.delta_precision(s.video_precision, self.sequence.meta.get("formula", "mandelbrot")),
                             iter_mult=1 if draft else max(1, int(s.video_iter_mult)),
                             use_bla=s.use_bla, interior=s.interior, overlay="depth" if s.video_overlay else "",
-                            adaptive=s.adaptive_export and not s.fast_movie, fast=s.fast_movie)
+                            adaptive=s.adaptive_export and not s.fast_movie, fast=s.fast_movie,
+                            fixed_auto=s.video_fixed_auto)
         name = (s.video_name or "mandelscope") + ("_draft" if draft else "")
         path = path or _unique(str(out_dir("Videos") / f"{name}_{w}x{h}.mp4"))
         Path(path).parent.mkdir(parents=True, exist_ok=True)

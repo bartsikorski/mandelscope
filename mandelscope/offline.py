@@ -11,7 +11,7 @@ from gmpy2 import mpfr
 from .mp import View
 from .reference import ReferenceOrbit, compute_reference
 from .bla import BLATable, build_bla, structure_for
-from .renderer import (GPUEngine, Field, GPURef, GPUBla, FieldParams, ColorSettings,
+from .renderer import (GPUEngine, Field, GPURef, GPUBla, FieldParams, ColorSettings, FixedAuto, fixed_auto_table,
                        AutoContrast, view_params, julia_params, julia_min_log2r)
 from .sequence import Sequence
 from .video import FfmpegWriter, PngSaver
@@ -254,6 +254,7 @@ class RenderSettings:
     adaptive: bool = False         # supersample only pixels near edges / the set (ss > 1)
     fast: bool = False             # sequences: frames cut out of shared key pictures (keymovie.py)
     iter_mult: int = 1             # iteration limit x this (stills and videos with more detail)
+    fixed_auto: bool = False       # videos: one 'auto' colour table for all frames (no colour drift)
 
 
 class FrameRenderer:
@@ -278,6 +279,7 @@ class FrameRenderer:
         self.jrefs = None               # deep Julia sets: JuliaReferences
         self._deep = False              # this frame of a Julia set uses perturbation
         self.formula = "mandelbrot"     # or "ship": the Burning Ship
+        self.fixed = None               # FixedAuto: 'auto' colours frozen for a whole video
 
     def _vp(self, view: View, img_w: int, img_h: int, **kw) -> FieldParams:
         if self.julia is not None and self._deep:
@@ -353,6 +355,9 @@ class FrameRenderer:
         self.fbo.release()
         self.tex.release()
         self.auto.release()
+        if self.fixed is not None:
+            self.fixed.release()
+            self.fixed = None
 
     def _colour_target(self, W, H):
         key = (W, H)
@@ -459,9 +464,14 @@ class FrameRenderer:
         #    smoothed) colours this one while this frame's is gathered for the next;
         #  * otherwise (first frame, stills in tiles, adaptive sampling): a small low-res pre-pass.
         single = self.tile_rows >= s.height and not adaptive
-        from_self = colors.mapping == 3 and single
-        from_frames = (colors.mapping == 3 and not single and self.hist_from_frames and self.auto.valid)
-        if from_self:
+        fixed = colors.mapping == 3 and self.fixed is not None
+        from_self = colors.mapping == 3 and single and not fixed
+        from_frames = (colors.mapping == 3 and not single and self.hist_from_frames and self.auto.valid
+                       and not fixed)
+        if fixed:
+            auto = self.fixed
+            colors = self.fixed.colours(colors)
+        elif from_self:
             pass
         elif from_frames:
             auto = self.auto
@@ -552,6 +562,47 @@ class FrameRenderer:
         self.stats.update(t_ref=t_ref, t_compute=time.perf_counter() - t1 - t_read, t_read=t_read, steps=steps,
                           bla_skips=bla, refined=frac, adaptive=adaptive, t_prepass=t_pre, syncs=syncs)
         return img
+
+    def fixed_auto_iter(self, views: list, anchors: list, worker=None, time_slice: float = 0.2,
+                        width: int = 128):
+        """Generator: low-resolution pictures of ``views`` (a sample of a video's frames) ->
+        self.fixed, one 'auto' colour table for all of them (yields ('colours', progress))."""
+        s = self.s
+        pw = min(s.width, width)
+        ph = max(8, int(round(pw * s.height / s.width)))
+        samples = []
+        for j, (v, anc) in enumerate(zip(views, anchors)):
+            v = self._more_iterations(v)
+            anc = self._more_iterations(anc)
+            # the references for the full-size frames: computed once here, reused by them
+            gen = self._prepare_refs(v, anc, worker, (s.width * max(1, int(s.ss)), s.height * max(1, int(s.ss))))
+            while True:
+                try:
+                    next(gen)
+                    yield ("colours", j / max(len(views), 1))
+                except StopIteration as e:
+                    gref, gbla = e.value
+                    break
+            kw = dict(double=self.prec, use_bla=s.use_bla, with_de=False, with_interior=s.interior)
+            pf = self._field(pw, ph)
+            fp = self._vp(v, pw, ph, **kw)
+            pf.reset()
+            self._configure(pf, fp, v, pw, ph, gref, gbla)
+            while not pf.step(time_slice, dispatch_target=DISPATCH_TARGET):
+                yield ("colours", (j + pf.progress) / max(len(views), 1))
+            r = pf.read_results()
+            n = r[..., 0].ravel()
+            frac = r[..., 1].ravel().view(np.float32)
+            ok = (n > 0) & (n < 0xFFFFFFFE) & (n <= v.max_iter)
+            samples.append(np.log2(n[ok].astype(np.float64) + frac[ok]))
+            yield ("colours", (j + 1) / max(len(views), 1))
+        if self.fixed is not None:
+            self.fixed.release()
+            self.fixed = None
+        t = fixed_auto_table(samples)
+        if t is not None:
+            self.fixed = FixedAuto(self.engine.ctx, *t)
+        return self.fixed
 
     def key_picture_iter(self, plan, *, with_de: bool, with_stripes: bool, stripe_freq: float,
                          anchor: View | None = None, worker=None, time_slice: float = 0.2):
@@ -653,6 +704,32 @@ def julia_settings(engine: GPUEngine, settings: RenderSettings, log2r: float) ->
     return settings
 
 
+FIXED_AUTO_SAMPLES = 120        # frames sampled (at low resolution) for a video's fixed 'auto' colours
+
+
+def fixed_auto_prepass(fr: FrameRenderer, seq: Sequence, times: list, css: list, worker=None,
+                       time_slice: float = 0.2, max_samples: int = FIXED_AUTO_SAMPLES):
+    """Generator: when ``fr.s.fixed_auto`` and some frames use the 'auto' mapping, one colour
+    table for all of them from low-resolution pictures of (up to ``max_samples``) evenly spread
+    frames -> fr.fixed.  Yields progress in [0, 1]."""
+    if not fr.s.fixed_auto:
+        return
+    idx = [k for k, c in enumerate(css) if c.mapping == 3 and c.method == 0]
+    if not idx:
+        return
+    if len(idx) > max_samples:
+        idx = [idx[int(round(j * (len(idx) - 1) / (max_samples - 1)))] for j in range(max_samples)]
+    views = [seq.view_at(times[k])[0] for k in idx]
+    anchors = [seq.deepest_in_segment(times[k]) for k in idx]
+    gen = fr.fixed_auto_iter(views, anchors, worker=worker, time_slice=time_slice)
+    while True:
+        try:
+            _, pr = next(gen)
+            yield pr
+        except StopIteration:
+            return
+
+
 def render_sequence_iter(engine: GPUEngine, seq: Sequence, path: str, settings: RenderSettings,
                          colors: ColorSettings, fps: float = 60.0, codec: str = "auto",
                          quality: int = 18, worker=None, png_dir: str | None = None,
@@ -681,6 +758,10 @@ def render_sequence_iter(engine: GPUEngine, seq: Sequence, path: str, settings: 
     fr.hist_from_frames = True
     n = seq.frame_count(fps)
     a, b = (0, n) if frame_range is None else frame_range
+    times = [seq.start + i / fps for i in range(a, b)]
+    for pr in fixed_auto_prepass(fr, seq, times, [apply_color_overrides(colors, seq.view_at(t)[1]) for t in times],
+                                 worker=worker, time_slice=time_slice):
+        yield dict(frame=a, frames=n, phase="colours", progress=0.0, eta=0.0, codec=None, prepass=pr)
     writer = FfmpegWriter(path, settings.width, settings.height, fps, codec, quality) if path else None
     pngs = PngSaver() if png_dir else None
     t_start = time.perf_counter()

@@ -477,3 +477,20 @@ def test_find_mini_ship():
             x, y = x * x - y * y + c.real, 2 * abs(x * y) - c.imag
         assert abs(mpc(x, y)) < mpfr(2) ** -200          # the nucleus: z_p = 0
     assert gt.iterate_ship(c, 5000, p)[0] == 0xFFFFFFFF   # (inside)
+
+
+def test_fixed_auto_table():
+    """A video's fixed 'auto' table: monotone, every frame weighs the same, and the palette
+    repeats scale up so that a frame covering half of the table shows twice the cycles."""
+    import numpy as np
+    from mandelscope.renderer import fixed_auto_table
+    rng = np.random.default_rng(1)
+    a = rng.uniform(10.0, 11.0, 50_000)          # a shallow frame, many samples
+    b = rng.uniform(15.0, 16.0, 500)             # a deep frame, few samples
+    lo, hi, cdf, scale = fixed_auto_table([a, b], bins=4096)
+    assert lo == pytest.approx(10.0, abs=0.02) and hi == pytest.approx(16.0, abs=0.02)
+    assert np.all(np.diff(cdf) >= 0) and cdf[0] == 0.0 and cdf[-1] == pytest.approx(1.0)
+    x = np.linspace(lo, hi, len(cdf))
+    assert np.interp(11.0, x, cdf) == pytest.approx(0.5, abs=0.05)   # equal weight per frame
+    assert 1.7 < scale < 2.3
+    assert fixed_auto_table([np.array([])]) is None
