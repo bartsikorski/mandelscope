@@ -79,14 +79,23 @@ struct Result {
     float r1;
 };
 
+// Skips (bla.py): z' = A z + B c (+ C z^2 + D z c + E c^2) over `len` iterations, valid while
+// log2|z| < logR.  The skips that start at the same iteration are stored one after another,
+// shortest first (a "chain"); the top bit of len marks the last (longest) one.  The 4th value
+// of the reference (refF[m].w) is the index of the shortest skip starting at m (-1: none).
 struct BLA {
     R2 Am;
     R2 Bm;
     int Ae;
     int Be;
     float logR;
-    float pad;
+    uint len;
 };
+const uint LEN_LAST = 0x80000000u;
+// a skip (or a failed lookup) costs about as much as this many more plain iterations: the
+// per-invocation budget counts them so, and dispatch times stay predictable
+const uint SKIP_WORK = 31u;
+const uint FAIL_WORK = 2u;
 
 layout(std430, binding = 0) buffer StateBuf  { Pix state[]; };
 layout(std430, binding = 1) buffer ResultBuf { Result res[]; };
@@ -149,15 +158,10 @@ uniform uint  uLenA;
 uniform uint  uLenB;
 uniform uint  uPerA;         // period of a periodic reference (0: none): its cycle is stored once,
 uniform uint  uPerB;         // and an index past the end wraps back by the period
-uniform int   uLevelsA;      // BLA table of reference A (offsets into the same table buffer)
-uniform uint  uLevOffA[32];
-uniform uint  uLevCntA[32];
+uniform uint  uBlaA;         // reference A has skips (in the same table buffer, before B's)
+uniform uint  uBlaB;         // reference B (the Mandelbrot set's only reference) has skips
 uniform float uBlaMaxLogRA;
 uniform float uDOne;         // 1: dz/dc (+1 per iteration, Mandelbrot); 0: dz/dz0 (Julia)
-uniform int   uLev0;
-uniform int   uLevels;
-uniform uint  uLevOff[32];
-uniform uint  uLevCnt[32];
 uniform uint  uMode;         // 0: order list, 1: pending list
 uniform uint  uStart;
 uniform uint  uCount;
@@ -180,9 +184,7 @@ uint refBase() { return gOnB ? uBaseB : 0u; }
 uint refLen() { return gOnB ? uLenB : uLenA; }
 uint refPer() { return gOnB ? uPerB : uPerA; }
 uint wrapm(uint m) { return (m >= refLen() && refPer() != 0u) ? m - refPer() : m; }
-int blaLevels() { return gOnB ? uLevels : uLevelsA; }
-uint levOff(int j) { return gOnB ? uLevOff[j] : uLevOffA[j]; }
-uint levCnt(int j) { return gOnB ? uLevCnt[j] : uLevCntA[j]; }
+bool blaOn() { return (gOnB ? uBlaB : uBlaA) != 0u; }
 float blaMaxLogR() { return gOnB ? uBlaMaxLogR : uBlaMaxLogRA; }
 
 float pow2f(int e) {
@@ -402,6 +404,7 @@ void main() {
     float log2h = log2(float(uHm)) + float(uHe);
 
     uint steps = 0u;
+    uint work = 0u;          // steps weighted by their cost: the budget of this invocation
     uint nbla = 0u;
     uint nfail = 0u;
     uint nreb = 0u;
@@ -531,44 +534,40 @@ void main() {
             done = true;
             break;
         }
-        if (steps >= uBudget) break;
+        if (work >= uBudget) break;
         steps++;
+        work++;
 
         // ------------------------------------------------ step phase
         bool stepped = false;
         bool plain = false;
 #ifndef SHIP
-        if (uUseBla != 0u && m >= 1u && blaLevels() > uLev0) {
-            uint mm = m - 1u;
-            uint mask0 = (1u << uint(uLev0)) - 1u;
+        int k0 = int(zr.w);          // shortest skip starting here (-1: none)
+        if (uUseBla != 0u && m >= 1u && k0 >= 0 && blaOn()) {
             // cheap gate (exponent only, no memory access): |w| >= 2^(k+e-1) is above every radius
             R mwg = max(abs(s.w.x), abs(s.w.y));
-            if ((mm & mask0) == 0u && m >= blaHold
-                    && (mwg == R(0) || float(s.k + expr(mwg) - 1) < blaMaxLogR())) {
+            if (m >= blaHold && (mwg == R(0) || float(s.k + expr(mwg) - 1) < blaMaxLogR())) {
                 float lw = float(s.k) + 0.5 * log2(float(dot(s.w, s.w)));
                 int best = -1;
-                uint bidx = 0u;
-                for (int j = uLev0; j < blaLevels(); ++j) {
-                    uint maskj = (1u << uint(j)) - 1u;
-                    if ((mm & maskj) != 0u) break;
-                    uint i = mm >> uint(j);
-                    if (i >= levCnt(j)) break;
-                    uint l = 1u << uint(j);
-                    if (s.n + l > uMaxIter) break;
-                    uint e = levOff(j) + i;
-                    if (!(lw < bla[e].logR)) break;
-                    best = j;
-                    bidx = e;
+                uint l = 0u;
+                // up the chain while the next longer skip is valid too (radii only shrink)
+                for (int e = k0; ; ++e) {
+                    uint ln = bla[e].len;
+                    uint le = ln & ~LEN_LAST;
+                    if (s.n + le > uMaxIter || !(lw < bla[e].logR)) break;
+                    best = e;
+                    l = le;
+                    if ((ln & LEN_LAST) != 0u) break;
                 }
                 if (best < 0 && uBlaBackoff != 0u) {
-                    // no valid skip here: try again after 2, 4, 8 ... x the shortest skip
+                    // no valid skip here: no lookup for 64, 128, 256 ... iterations
                     blaMiss = min(blaMiss + 1u, 8u);
-                    blaHold = m + ((1u << uint(uLev0)) << blaMiss);
+                    blaHold = m + (32u << blaMiss);
                 }
-                if (best < 0) nfail++;
+                if (best < 0) { nfail++; work += FAIL_WORK; }
                 if (best >= 0) {
+                    uint bidx = uint(best);
                     BLA b = bla[bidx];
-                    uint l = 1u << uint(best);
                     blaMiss = 0u;
                     bool fast = false;
                     if (uBlaFast != 0u && b.Ae != EXP_ZERO && mwg != R(0)) {
@@ -632,6 +631,7 @@ void main() {
                     d = scale2(dc.m, dc.e - s.k);
                     dcfast = (dc.e - s.k) <= RB;
                     nbla++;
+                    work += SKIP_WORK;
                     stepped = true;
                 }
             }
@@ -723,12 +723,11 @@ void main() {
                 // rebase, a tiny reference value, a BLA opportunity, |w| leaving the safe range -
                 // so the main loop handles that iteration exactly as before.  Scaling by powers of
                 // two is exact, so the results are the same as without runs.
-                uint lim = min(min(uMaxIter - s.n, uBudget - steps), uRun);
+                uint lim = min(min(uMaxIter - s.n, uBudget - work), uRun);
 #ifdef WITH_DE
                 vec2 one = vec2(pow2f(-s.De) * uDOne, 0.0);
 #endif
-                uint mask0r = (1u << uint(uLev0)) - 1u;
-                bool blaOn = uUseBla != 0u && blaLevels() > uLev0;
+                bool blaRun = uUseBla != 0u && blaOn();
 #ifdef WITH_INTERIOR
                 float emin = 3.0e38;      // smallest |dz/dz1| of the run (it dips once per cycle)
 #endif
@@ -739,14 +738,13 @@ void main() {
                     if (zq.z != R(0)) break;
                     R mwr = max(abs(s.w.x), abs(s.w.y));
                     if (mwr < W_LO || mwr > W_HI) break;
-                    if (blaOn && ((mr - 1u) & mask0r) == 0u && mr >= blaHold) {
+                    if (blaRun && zq.w >= R(0) && mr >= blaHold) {
                         float lwq = float(s.k + expr(mwr) - 1);          // <= log2|w 2^k|
                         if (lwq < blaMaxLogR()) {
                             if (uBlaPrefilter == 0u) break;
                             // leaving the run costs as much as ~10 plain iterations: only for a
                             // lookup that can succeed (the shortest skip's radius at this m)
-                            uint i0 = (mr - 1u) >> uint(uLev0);
-                            if (i0 < levCnt(uLev0) && lwq < bla[levOff(uLev0) + i0].logR) break;
+                            if (lwq < bla[int(zq.w)].logR) break;
                         }
                     }
                     R2 dzv = Sf * s.w;
@@ -776,6 +774,7 @@ void main() {
                     s.m = mr + 1u;
                     s.n += 1u;
                     steps++;
+                    work++;
                 }
 #ifdef WITH_INTERIOR
                 // the main loop checks only the current value: hand it the dip of the run

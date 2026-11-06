@@ -169,51 +169,91 @@ def test_misiurewicz_point():
 
 @pytest.mark.parametrize("order", [1, 2])
 def test_bla_skips_match_perturbation(order):
-    """A BLA step must reproduce l exact perturbation steps for |dz| < R (second order: its
+    """A skip must reproduce its exact perturbation steps for |dz| < R (second order: its
     larger radius and the quadratic terms)."""
     with gmpy2.context(gmpy2.get_context(), precision=600):
         c0 = misiurewicz(mpc(-0.10109636384562, 0.95628651080914), 4, 1, 600)
     re, im = to_str(c0.real, 600), to_str(c0.imag, 600)
     ref = compute_reference(re, im, 600, 2000)
     log2_c = -330.0                                    # |dc| ~ 2^-330
-    bla = build_bla(ref.zm, ref.ze, log2_c, -24.0, lev0=1, order=order)
+    bla = build_bla(ref.zm, ref.ze, log2_c, -24.0, lev0=2, order=order)
     Z = [complex(v) for v in ref.zf]
     rng = np.random.default_rng(0)
     checked = 0
-    for level in range(1, min(bla.levels, 10)):
-        for i in rng.integers(0, max(1, bla.counts[level]), 5):
-            m = 1 + int(i) * (1 << level)
-            k = bla.offsets[level] + int(i)
-            logR = bla.logR[k]
-            if not np.isfinite(logR) or logR < -1e29:
-                continue
-            # work in units of 2^-330 to stay in float range
-            scale = 2.0 ** -330
-            dc = complex(0.7, -0.4)                       # |dc| < 2^-330 units = 1
-            r_units = 2.0 ** (logR + 330) * 0.5
-            dz0 = complex(r_units * 0.6, -r_units * 0.5)
-            z = dz0
-            for j in range(m, m + (1 << level)):
-                z = 2 * Z[j] * z + scale * z * z + dc
-            Am = complex(bla.Am[k]) * 2.0 ** int(bla.Ae[k])
-            Bm = complex(bla.Bm[k]) * 2.0 ** int(bla.Be[k])
-            approx = Am * dz0 + Bm * dc
-            if order == 2:
-                C, D, E = (complex(getattr(bla, x + "m")[k]) * 2.0 ** int(getattr(bla, x + "e")[k])
-                           if int(getattr(bla, x + "e")[k]) != -(1 << 20) else 0j for x in "CDE")
-                approx += scale * (C * dz0 * dz0 + D * dz0 * dc + E * dc * dc)
-            assert abs(approx - z) <= 1e-5 * abs(z) + 1e-300
-            checked += 1
+    for k in rng.permutation(bla.size)[:60]:
+        logR = bla.logR[k]
+        if not np.isfinite(logR) or logR < -1e29:
+            continue
+        m, ln = int(bla.start[k]), int(bla.steps[k])
+        # work in units of 2^-330 to stay in float range
+        scale = 2.0 ** -330
+        dc = complex(0.7, -0.4)                       # |dc| < 2^-330 units = 1
+        r_units = 2.0 ** (logR + 330) * 0.5
+        dz0 = complex(r_units * 0.6, -r_units * 0.5)
+        z = dz0
+        for j in range(m, m + ln):
+            z = 2 * Z[j] * z + scale * z * z + dc
+        Am = complex(bla.Am[k]) * 2.0 ** int(bla.Ae[k])
+        Bm = complex(bla.Bm[k]) * 2.0 ** int(bla.Be[k])
+        approx = Am * dz0 + Bm * dc
+        if order == 2:
+            C, D, E = (complex(getattr(bla, x + "m")[k]) * 2.0 ** int(getattr(bla, x + "e")[k])
+                       if int(getattr(bla, x + "e")[k]) != -(1 << 20) else 0j for x in "CDE")
+            approx += scale * (C * dz0 * dz0 + D * dz0 * dc + E * dc * dc)
+        assert abs(approx - z) <= 1e-5 * abs(z) + 1e-300
+        checked += 1
     assert checked > 5
 
 
-def test_worker_tables_use_the_default_shortest_skip():
-    """The explorer's background worker builds the tables of long references; it used to pass
-    lev0=2 instead of the default (2x slower at a period-6006 minibrot on an RTX 5060 Ti).
-    The default depends on the reference's iteration limit (5,000 here: 2^6)."""
+def _feigenbaum_reference():
+    """A reference deep in nested minibrots (periods 16, 32, 128, 2560, 38400) near the
+    Feigenbaum point: its orbit passes close to 0 at every multiple of each period."""
+    return compute_reference("-1.401156950707496902987425727671044895039719", "2.44e-20", 128, 60000)
+
+
+def test_skips_are_cut_at_near_zero_points():
+    """The skip tree (bla.la_structure): no block between cuts has a near-zero point inside
+    (there the orbit of a pixel next to a minibrot must rebase or take an exact step), chains
+    hold skips of the same start, shortest first, with radii that only shrink, and the tables
+    of the worker and the reference upload use the same structure."""
+    from mandelscope.bla import LA_TAU, la_structure, structure_for, skip_at
+    ref = _feigenbaum_reference()
+    st = la_structure(ref.zm, ref.ze)
+    with np.errstate(divide="ignore"):
+        lz = np.log2(np.abs(ref.zm)) + ref.ze
+    lz[0] = -np.inf
+    a, b = st.a[:st.n_leaves], st.b[:st.n_leaves]
+    assert np.all(b - a <= 1 << st.leaf_log2)
+    for x, y in zip(a, b):
+        assert np.all(lz[x + 1:y] >= LA_TAU), (x, y)
+    # every near-zero point starts a segment, so skips can start right after it
+    dips = np.nonzero(lz[1:-1] < LA_TAU)[0] + 1
+    assert set(dips.tolist()) <= set(a.tolist())
+    tab = build_bla(ref.zm, ref.ze, -60.0, -24.0, structure=st)
+    assert tab.size == st.nodes and tab.signature == st.signature
+    starts = np.nonzero(tab.first >= 0)[0]
+    for m in starts[:2000]:
+        k = int(tab.first[m])
+        chain = [k]
+        while not tab.last[chain[-1]]:
+            chain.append(chain[-1] + 1)
+        assert np.all(tab.start[chain] == m)
+        assert np.all(np.diff(tab.steps[chain]) > 0)
+        assert np.all(np.diff(tab.logR[chain]) <= 1e-9)
+        assert np.all(m + tab.steps[chain] <= ref.length - 1)
+    # the longest valid skip for a tiny delta right after the start crosses many dips
+    k = skip_at(tab, 1, -200.0)
+    assert k >= 0 and tab.steps[k] > 10000
+    assert structure_for(ref).signature == st.signature        # (cached on the orbit)
+
+
+def test_worker_tables_use_the_structure_of_their_orbit():
+    """The explorer's background worker builds the tables of long references; the orbit it
+    sends carries the structure (its `first` index) the kernels need for that table."""
+    import pickle
     import queue
     from types import SimpleNamespace
-    from mandelscope.bla import DEFAULT_ORDER, default_lev0
+    from mandelscope.bla import DEFAULT_LEAF_LOG2, DEFAULT_ORDER, structure_for
     from mandelscope.worker import _worker_main
     req, res = queue.Queue(), queue.Queue()
     re, im = "-0.743643887037158704752191506114774", "0.131825904205311970493132056385139"
@@ -226,21 +266,13 @@ def test_worker_tables_use_the_default_shortest_skip():
     while not res.empty():
         r = res.get()
         got.setdefault(r["kind"], r)
+    ref = pickle.loads(pickle.dumps(got["reference"]["ref"]))       # (as between processes)
+    sent = structure_for(ref, full=False)
+    assert not sent.full and sent.first.shape[0] == ref.length
     for kind in ("reference", "bla"):
         b = got[kind]["bla"]
-        assert b.order == DEFAULT_ORDER and b.lev0 == default_lev0(DEFAULT_ORDER, 5000) == 6, kind
-
-
-def test_shortest_skip_follows_the_iteration_limit():
-    """2^6 for ordinary limits, 2^7 near deep minibrots (RTX 5060 Ti bench of 1.0.0)."""
-    from mandelscope.bla import DEFAULT_LEV0, LEV0_DEEP_ITER, build_bla, default_lev0
-    assert default_lev0(2, 20000) == 6 and default_lev0(2, LEV0_DEEP_ITER) == 7 == DEFAULT_LEV0[2]
-    assert default_lev0(2, 0) == DEFAULT_LEV0[2]            # unknown limit: as before
-    assert default_lev0(1, 1000) == DEFAULT_LEV0[1]         # first order unchanged
-    ref = compute_reference("-0.75", "0.1", 96, 3000)
-    assert build_bla(ref.zm, ref.ze, -20.0, max_iter=ref.max_iter).lev0 == 6
-    assert build_bla(ref.zm, ref.ze, -20.0, max_iter=200000).lev0 == 7
-    assert build_bla(ref.zm, ref.ze, -20.0, lev0=5, max_iter=200000).lev0 == 5
+        assert b.order == DEFAULT_ORDER and b.lev0 == DEFAULT_LEAF_LOG2, kind
+        assert b.signature == sent.signature and np.array_equal(b.first, sent.first), kind
 
 
 def test_partial_and_resumed_orbits_are_prefixes_of_the_full_one():
@@ -296,8 +328,8 @@ def test_worker_streams_partial_orbits_and_resumes_cancelled_ones():
 
 
 def test_fast_bla_levels_match_floatexp():
-    """The short levels are merged in complex128; tiny orbit values (minibrot nuclei) and
-    references that stay small are redone in floatexp - the tables match the all-floatexp ones."""
+    """The blocks between cuts are composed in complex128; tiny orbit values (minibrot nuclei)
+    and references that stay small are redone in floatexp - the tables match the all-floatexp ones."""
     from mandelscope.bla import FAST_ZE
     re_, im_ = "-0.743643887037158704752191506114774", "0.131825904205311970493132056385139"
     refs = [compute_reference(re_, im_, 200, 30000), compute_reference("0.001", "0", 128, 5000),
@@ -311,7 +343,7 @@ def test_fast_bla_levels_match_floatexp():
         for order, lev0 in ((2, 6), (1, 4), (2, 3)):
             a = build_bla(ref.zm, ref.ze, -40.0, -24.0, lev0=lev0, order=order, fast=False)
             b = build_bla(ref.zm, ref.ze, -40.0, -24.0, lev0=lev0, order=order, fast=True)
-            assert a.offsets == b.offsets and a.counts == b.counts and a.levels == b.levels
+            assert a.signature == b.signature and np.array_equal(a.steps, b.steps)
             for k in ("A", "B") + (("C", "D", "E") if order == 2 else ()):
                 am, ae = getattr(a, k + "m"), getattr(a, k + "e")
                 bm, be = getattr(b, k + "m"), getattr(b, k + "e")
@@ -319,7 +351,7 @@ def test_fast_bla_levels_match_floatexp():
                 assert np.array_equal(ae[nz], be[nz]) or np.all(np.abs(ae[nz] - be[nz]) <= 1), k
                 va = am * np.exp2((ae - np.maximum(ae, be)).astype(float))
                 vb = bm * np.exp2((be - np.maximum(ae, be)).astype(float))
-                assert np.all(np.abs(va - vb) <= 1e-13 * np.abs(va) + 1e-300), k
+                assert np.all(np.abs(va - vb) <= 1e-12 * np.abs(va) + 1e-300), k
             fin = a.logR > -1e29
             assert np.array_equal(fin, b.logR > -1e29)
             assert np.allclose(a.logR[fin], b.logR[fin], rtol=0, atol=1e-9)

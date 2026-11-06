@@ -1434,7 +1434,7 @@ def _tab_render(app):
                             f", {r.elapsed:.2f}s")
     b = app.refs.bla if hasattr(app, "refs") else None
     if b is not None:
-        imgui.text_disabled(f"BLA table: {b.levels} levels, {b.size:,} entries")
+        imgui.text_disabled(f"skip table: {b.size:,} skips, blocks of {1 << b.lev0}")
     imgui.text_disabled(app.engine.renderer_name if app.engine else "")
     imgui.text_disabled(f"frame {app.frame_ms:.1f} ms")
 
