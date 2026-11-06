@@ -248,28 +248,31 @@ def interactive_ops(eng, fr, cases, w, h):
 
 
 def bla_bench(eng, w, h, reps: int = 3, names=None, variants=None):
-    """Deep, high-iteration places: BLA order, shortest stored skip (lev0) and how skips are
-    computed, one full picture each (wall time and GPU time, best of `reps`, interleaved)."""
+    """Deep, high-iteration places: the skip tree's block size and shortest stored skip, and the
+    engine's skip options, one full picture each (wall time and GPU time, best of `reps`,
+    interleaved)."""
     from .renderer import Field, GPURef, GPUBla, view_params
     from .reference import compute_reference
-    from .bla import build_bla
+    from .bla import build_bla, la_structure, DEFAULT_LEAF_LOG2, MIN_SKIP
     from dataclasses import replace
     here = Path(__file__).parent / "locations"
-    names = names or ["minibrot_p153231", "minibrot_p6006", "seahorse_1e-12", "spiral_1e-100", "deep_1e-1000"]
-    # (label, order, lev0, engine options); the first is the default.  lev0 None: chosen by the
-    # place's iteration limit (bla.default_lev0: 2^6 below 65,536 iterations, else 2^7)
+    names = names or ["nested_minibrots", "minibrot_p153231", "minibrot_p6006", "seahorse_1e-12",
+                      "spiral_1e-100", "deep_1e-1000"]
+    # (label, block size 2^leaf, shortest stored skip, engine options); the first is the default
+    L, M = DEFAULT_LEAF_LOG2, MIN_SKIP
     variants = variants or [
-        ("auto run32", 2, None, dict(run_length=32)),
-        ("2^7 run32", 2, 7, dict(run_length=32)),
-        ("2^6 run16", 2, 6, dict(run_length=16)),
-        ("2^6 run32", 2, 6, dict(run_length=32)),
-        ("2^7 run16", 2, 7, dict(run_length=16)),
-        ("2^8 run32", 2, 8, dict(run_length=32)),
-        ("2^7 run64", 2, 7, dict(run_length=64)),
-        ("2^7 -pre", 2, 7, dict(run_length=32, bla_prefilter=False)),
+        ("default", L, M, {}),
+        ("min 2", L, 2, {}),
+        ("min 64", L, 64, {}),
+        ("blocks 2^4", 4, M, {}),
+        ("blocks 2^6", 6, M, {}),
+        ("run8", L, M, dict(run_length=8)),
+        ("run32", L, M, dict(run_length=32)),
+        ("-pre", L, M, dict(bla_prefilter=False)),
     ]
-    print(f"\n-- deep renders: second-order BLA, shortest skip 2^lev0, skip options (float32, {w}x{h}, best of {reps}) --")
-    print("    auto: 2^6 below 65,536 iterations, 2^7 above (default);  runN: N plain iterations per run (default 32);"
+    print(f"\n-- deep renders: skips cut at the orbit's near-zero points (float32, {w}x{h}, best of {reps}) --")
+    print(f"    default: blocks of 2^{L} between near-zero points, skips of {M}+ iterations stored;"
+          "  minN: shortest stored skip;  runN: plain iterations per run (default 16);"
           "  -pre: runs leave for every lookup")
     print(f"    {'place':18s}" + "".join(f"{lab:>16s}" for lab, *_ in variants)
           + "      (wall / GPU ms; below: steps / skips / failed lookups per pixel)")
@@ -282,20 +285,22 @@ def bla_bench(eng, w, h, reps: int = 3, names=None, variants=None):
         v = load_location(str(p))[0]
         ref = compute_reference(str(v.re), str(v.im), v.needed_precision(h) + 32, v.max_iter)
         ref.ref_id = 1
-        gref = GPURef(eng.ctx, ref, False)
         fp = view_params(v, v.re, v.im, w, h, with_de=True)
+        # a table only fits an upload of the reference made with the same structure
         tabs = {}
-        for _, o, lv, _ in variants:
-            if (o, lv) not in tabs:
-                tabs[(o, lv)] = GPUBla(eng.ctx, build_bla(ref.zm, ref.ze, fp.log2_cmax, -24.0, lev0=lv, order=o,
-                                                         max_iter=v.max_iter), False)
+        for _, leaf, ms, _ in variants:
+            if (leaf, ms) not in tabs:
+                ref.la = la_structure(ref.zm, ref.ze, leaf, min_skip=ms)
+                tabs[(leaf, ms)] = (GPURef(eng.ctx, ref, False),
+                                    GPUBla(eng.ctx, build_bla(ref.zm, ref.ze, fp.log2_cmax, -24.0,
+                                                              structure=ref.la), False))
         best = {lab: (1e9, 1e9, 0, 0, 0) for lab, *_ in variants}
         f = Field(eng, w, h, False)
         for _ in range(reps):
-            for lab, o, lv, opts in variants:
-                eng.opt = replace(base, bla_order=o, **opts)
+            for lab, leaf, ms, opts in variants:
+                eng.opt = replace(base, **opts)
                 f.reset()
-                f.configure(fp, gref, tabs[(o, lv)])
+                f.configure(fp, *tabs[(leaf, ms)])
                 eng.ctx.finish()
                 t0 = time.perf_counter()
                 with q:
@@ -314,9 +319,9 @@ def bla_bench(eng, w, h, reps: int = 3, names=None, variants=None):
         print(f"    {'':18s}" + "".join(f"{'%s/%s/%s' % (f'{best[k][2]:,.0f}', f'{best[k][3]:,.0f}', f'{best[k][4]:,.0f}'):>16s}"
                                         for k, *_ in variants), flush=True)
         f.release()
-        for gb in tabs.values():
+        for gr, gb in tabs.values():
             gb.release()
-        gref.release() if hasattr(gref, "release") else None
+            getattr(gr, "release", lambda: None)()
     getattr(q, "release", lambda: None)()
 
 
@@ -720,7 +725,7 @@ def main(argv=None):
     b.add_argument("--experiments", action="store_true",
                    help="also A/B-test engine options (sync, BLA gate, budget, interior, adaptive ss)")
     b.add_argument("--bla", action="store_true",
-                   help="deep places: first- vs second-order BLA and the shortest skip")
+                   help="deep places: block size and shortest skip of the skip tree, skip options")
     m = sub.add_parser("get-mesa", help="Windows: install Mesa's software OpenGL for CPU mode")
     m.add_argument("--dest", default=None, help="folder (default: %%LOCALAPPDATA%%\\mandelscope\\mesa)")
     m.add_argument("--archive", default=None, help="install from a downloaded mesa-llvmpipe .7z / .zip")

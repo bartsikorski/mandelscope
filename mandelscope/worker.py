@@ -16,7 +16,7 @@ import traceback
 def _worker_main(req_q, res_q, cancel_val):
     # imports inside the child process
     from .reference import compute_reference
-    from .bla import build_bla
+    from .bla import build_bla, structure_for
     from .nucleus import find_minibrot
     from .mp import to_str
 
@@ -75,8 +75,8 @@ def _worker_main(req_q, res_q, cancel_val):
                     r.ref_id = jid
                     b = None
                     if job.get("log2_cmax") is not None:
-                        b = build_bla(r.zm, r.ze, job["log2_cmax"], job["log2_eps"], lev0=job.get("lev0"),
-                                      max_iter=r.max_iter)
+                        b = build_bla(r.zm, r.ze, job["log2_cmax"], job["log2_eps"],
+                                      structure=structure_for(r, job.get("lev0")))
                         b.ref_id = jid
                     res_q.put({"id": jid, "kind": "partial", "ref": r, "bla": b})
 
@@ -98,7 +98,7 @@ def _worker_main(req_q, res_q, cancel_val):
                 bla = None
                 if job.get("log2_cmax") is not None:
                     bla = build_bla(ref.zm, ref.ze, job["log2_cmax"], job["log2_eps"],
-                                    lev0=job.get("lev0"), max_iter=ref.max_iter)
+                                    structure=structure_for(ref, job.get("lev0")))
                     bla.ref_id = jid
                 state = ref.state
                 ref.state = None          # mpc objects stay in the worker
@@ -130,8 +130,8 @@ def _worker_main(req_q, res_q, cancel_val):
                 if ref is None:
                     res_q.put({"id": jid, "kind": "error", "error": "reference not cached"})
                     continue
-                bla = build_bla(ref.zm, ref.ze, job["log2_cmax"], job["log2_eps"], lev0=job.get("lev0"),
-                                max_iter=ref.max_iter)
+                bla = build_bla(ref.zm, ref.ze, job["log2_cmax"], job["log2_eps"],
+                                structure=structure_for(ref, job.get("lev0")))
                 bla.ref_id = job["ref_id"]
                 res_q.put({"id": jid, "kind": "bla", "bla": bla})
             elif kind == "minibrot":

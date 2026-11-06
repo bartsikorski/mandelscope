@@ -10,7 +10,7 @@ from gmpy2 import mpfr
 
 from .mp import View
 from .reference import ReferenceOrbit, compute_reference
-from .bla import BLATable, build_bla
+from .bla import BLATable, build_bla, structure_for
 from .renderer import (GPUEngine, Field, GPURef, GPUBla, FieldParams, ColorSettings,
                        AutoContrast, view_params, julia_params, julia_min_log2r)
 from .sequence import Sequence
@@ -78,6 +78,8 @@ class ReferenceCache:
             return False
         if b.ref_id != self.ref.ref_id or abs(b.log2_eps - log2_eps) > 1e-9:
             return False
+        if b.length != self.ref.length:
+            return False                     # (a table of a shorter, partial orbit)
         return fp.log2_cmax <= b.log2_cmax + 1e-9 and b.log2_cmax - fp.log2_cmax < 6.0
 
     # ------------------------------------------------------------ updates
@@ -152,8 +154,8 @@ def compute_julia_references(req: dict, log2_eps: float, ref_b: ReferenceOrbit |
                               cancelled=cancelled, progress=(lambda f: progress(0.5 + 0.5 * f)) if progress else None)
     if ref_a is None:
         return None
-    bla_a = build_bla(ref_a.zm, ref_a.ze, JULIA_NO_C, log2_eps)
-    bla_b = build_bla(ref_b.zm, ref_b.ze, JULIA_NO_C, log2_eps)
+    bla_a = build_bla(ref_a.zm, ref_a.ze, JULIA_NO_C, log2_eps, structure=structure_for(ref_a))
+    bla_b = build_bla(ref_b.zm, ref_b.ze, JULIA_NO_C, log2_eps, structure=structure_for(ref_b))
     return ref_a, ref_b, bla_a, bla_b
 
 
@@ -423,7 +425,7 @@ class FrameRenderer:
                 self.refs.set_reference(ref, None)
         fp = view_params(view, self.refs.ref_re, self.refs.ref_im, img_w, img_h)
         if self.formula != "ship" and not self.refs.bla_usable(fp, self.eps):
-            b = build_bla(self.refs.ref.zm, self.refs.ref.ze, fp.log2_cmax, self.eps, max_iter=self.refs.ref.max_iter)
+            b = build_bla(self.refs.ref.zm, self.refs.ref.ze, fp.log2_cmax, self.eps, structure=structure_for(self.refs.ref))
             b.ref_id = self.refs.ref.ref_id
             self.refs.set_bla(b)
 

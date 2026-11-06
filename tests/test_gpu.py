@@ -75,6 +75,25 @@ def _field(engine, v, W, H, double=False, budget=2048, use_bla=True):
     return f, ref, bla
 
 
+def test_nested_minibrots_skip_their_near_zero_points(engine, locations):
+    """Deep in nested minibrots (near the Feigenbaum point: periods 16, 32, 128, 2560, 38400 at
+    10^-17) every pixel's orbit passes close to 0 at each multiple of each period.  Skips of
+    2^j iterations from iteration 1 could not cross those points: 38,500 GPU steps per pixel
+    at 260,000 iterations (v3.14).  Skips cut at them: ~3,700.  The escape counts are chaotic
+    here (float32 rounding alone changes most of them), so the distributions are compared."""
+    v = View.from_dict(json.loads((locations / "nested_minibrots.json").read_text())["view"])
+    W, H = 40, 24
+    res, info = render_view(engine, v, W, H)
+    plain, pinfo = render_view(engine, v, W, H, use_bla=False)
+    assert info["complete"] and pinfo["complete"]
+    assert stats(res)["unfinished"] == 0
+    assert info["steps"] / (W * H) < 6000 and pinfo["steps"] / (W * H) > 100000
+    n, p = res[..., 0].astype(np.int64).ravel(), plain[..., 0].astype(np.int64).ravel()
+    n, p = n[n < 0xFFFFFFFE], p[p < 0xFFFFFFFE]
+    for q in (10, 50, 90):
+        assert abs(np.percentile(n, q) / np.percentile(p, q) - 1) < 0.02, q
+
+
 def test_small_budget_resumes_identically(engine):
     v = misiurewicz_view(100, 5000)
     f1, _, _ = _field(engine, v, 48, 32, budget=1 << 16)
@@ -847,13 +866,15 @@ def test_iteration_octaves_match_the_results(engine, locations):
 
 def test_step_stays_inside_its_time_slice(engine):
     """Field.step stops before a dispatch that would end after the time slice (v3.7 overshot
-    10 ms slices by up to half a slice on new pictures)."""
+    10 ms slices by up to half a slice on new pictures).  (1536x960: with the skips cut at
+    near-zero points a 768x480 picture took only 3 slices, and the median was the first one's,
+    which starts from a guessed dispatch time.)"""
     import time as _t
     from mandelscope.renderer import GPUEngine, EngineOptions
 
     def overshoot(predictive):
         eng = GPUEngine(engine.ctx, EngineOptions(predictive_budget=predictive))
-        f, _, _ = _field(eng, misiurewicz_view(100, 20000), 768, 480)
+        f, _, _ = _field(eng, misiurewicz_view(100, 20000), 1536, 960)
         f.chunk = 4096
         over = []
         while True:

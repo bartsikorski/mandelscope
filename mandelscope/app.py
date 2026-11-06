@@ -31,7 +31,7 @@ from .script import compile_script, sequence_to_script, ai_prompt
 from .library import Library, user_root, location_from_png
 from .video import FfmpegWriter
 from .worker import Worker
-from .bla import build_bla
+from .bla import build_bla, structure_for
 from .control import (ZOOM_OMEGA, spring_step, UNDECIDED_OK, iteration_advice, FramePacer,  # noqa: F401
                       auto_motion_level, PadInput, pad_controls)
 from . import software
@@ -310,7 +310,7 @@ class LookPreviews:
             key = key[:-1] + (getattr(refs, "gpu_serial", 0),)
             fp = view_params(v, refs.ref_re, refs.ref_im, self.w, self.h, with_de=True,
                              with_interior=a.settings.interior, with_stripes=True,
-                             use_bla=gbla is not None and gbla.levels > 0, julia=deep,
+                             use_bla=gbla is not None and (gbla.size or gbla.size_a) > 0, julia=deep,
                              formula="mandelbrot" if julia else a.formula)
             f.reset()
             f.configure(fp, gref, gbla)
@@ -1830,7 +1830,7 @@ class App:
             # skips while waiting for it).  When the camera stops, a tight table again.
             b = self.refs.bla
             valid = (b is not None and b.ref_id == ref.ref_id and abs(b.log2_eps - eps) < 1e-9
-                     and fp.log2_cmax <= b.log2_cmax)
+                     and fp.log2_cmax <= b.log2_cmax and b.length == ref.length)
             slack = (b.log2_cmax - fp.log2_cmax) if valid else -1.0
             out = max(0.0, self.vel[0]) if moving else 0.0
             margin = 1.0 + min(6.0, 0.6 * out)
@@ -1839,7 +1839,7 @@ class App:
                     or (not moving and slack > 2.5))
         if not julia and not ship and want:
             if ref.length < 60000:
-                nb = build_bla(ref.zm, ref.ze, fp.log2_cmax + margin, eps, max_iter=ref.max_iter)
+                nb = build_bla(ref.zm, ref.ze, fp.log2_cmax + margin, eps, structure=structure_for(ref))
                 nb.ref_id = ref.ref_id
                 self.refs.set_bla(nb)
             else:

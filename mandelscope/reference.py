@@ -52,6 +52,8 @@ class ReferenceOrbit:
     # below the other (zf and zm round such a part to 0, and diffabs needs the sign of XY)
     xym: np.ndarray | None = None
     xye: np.ndarray | None = None
+    # the skip structure of this orbit (bla.LAStructure; made on first use, see bla.structure_for)
+    la: object | None = None
 
     @property
     def length(self) -> int:

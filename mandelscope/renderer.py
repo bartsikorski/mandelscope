@@ -27,7 +27,7 @@ from gmpy2 import mpfr
 from .mp import View, mp_ratio_to_float
 from .palettes import make_palette
 from .reference import ReferenceOrbit
-from .bla import BLATable
+from .bla import BLATable, structure_for
 
 SHADER_DIR = Path(__file__).parent / "shaders"
 RES_MAXITER = 0xFFFFFFFF
@@ -99,11 +99,20 @@ def _setc(prog, name, value):
 class GPURef:
     """Reference orbit on the GPU.
 
-    refF: vec4 per iteration (Z.re, Z.im, small-flag, 0) - one 16-byte load per step;
+    refF: vec4 per iteration (Z.re, Z.im, small-flag, first skip) - one 16-byte load per step;
+    the 4th value is the index of the shortest skip that starts at this iteration (-1: none,
+    bla.LAStructure.first), so the kernels find skips without another memory access;
     refM/refE: floatexp copy used only where the reference is tiny."""
 
-    def __init__(self, ctx: moderngl.Context, ref: ReferenceOrbit, double: bool):
+    def __init__(self, ctx: moderngl.Context, ref: ReferenceOrbit, double: bool,
+                 first: np.ndarray | None = None):
         n = ref.length
+        self.la_sig = self.la_sig_a = None          # LAStructure.signature (Julia: of B, of A)
+        self.la_nodes_a = 0
+        if first is None:
+            st = structure_for(ref, full=False)
+            first = st.first
+            self.la_sig = st.signature
         self.length = n
         self.double = double
         self.ref = ref
@@ -114,11 +123,13 @@ class GPURef:
         f[:, 0] = ref.zf.real
         f[:, 1] = ref.zf.imag
         f[:, 2] = small
+        f[:, 3] = first[:n]
         if double == PREC_FF:
-            # RefQ: (X.hi, Y.hi, X.lo, Y.lo) and (small, 0, 0, 0); mantissas as float-float
+            # RefQ: (X.hi, Y.hi, X.lo, Y.lo) and (small, first skip, 0, 0); mantissas as float-float
             zf = np.zeros((n, 8), dtype=np.float32)
             zf[:, 0:4] = ff_complex(ref.zf)
             zf[:, 4] = small
+            zf[:, 5] = first[:n]
             zm = ff_complex(ref.zm)
         elif double:
             zf = f
@@ -152,7 +163,11 @@ class GPURef:
         both = ReferenceOrbit(re=ref_a.re, im=ref_a.im, prec=ref_a.prec,
                               zf=np.concatenate([ref_a.zf, ref_b.zf]), zm=np.concatenate([ref_a.zm, ref_b.zm]),
                               ze=np.concatenate([ref_a.ze, ref_b.ze]), escaped=ref_a.escaped)
-        g = cls(ctx, both, double)
+        # skips: the table of A comes first in GPUBla (see there), B's indices follow it
+        sa, sb = structure_for(ref_a, full=False), structure_for(ref_b, full=False)
+        fb = np.where(sb.first >= 0, sb.first + sa.nodes, -1)
+        g = cls(ctx, both, double, first=np.concatenate([sa.first, fb]))
+        g.la_sig, g.la_sig_a, g.la_nodes_a = sb.signature, sa.signature, sa.nodes
         g.ref = ref_a
         g.ref_b = ref_b
         g.base_b, g.len_a, g.len_b = ref_a.length, ref_a.length, ref_b.length
@@ -162,11 +177,11 @@ class GPURef:
 
 BLA_DTYPE = {
     False: np.dtype([("Am", "<f4", 2), ("Bm", "<f4", 2), ("Ae", "<i4"), ("Be", "<i4"),
-                     ("logR", "<f4"), ("pad", "<f4")]),
+                     ("logR", "<f4"), ("len", "<u4")]),
     True: np.dtype([("Am", "<f8", 2), ("Bm", "<f8", 2), ("Ae", "<i4"), ("Be", "<i4"),
-                    ("logR", "<f4"), ("pad", "<f4")]),
+                    ("logR", "<f4"), ("len", "<u4")]),
     PREC_FF: np.dtype([("Am", "<f4", 4), ("Bm", "<f4", 4), ("Ae", "<i4"), ("Be", "<i4"),
-                       ("logR", "<f4"), ("pad", "<f4")]),
+                       ("logR", "<f4"), ("len", "<u4")]),
 }
 
 
@@ -198,6 +213,8 @@ def _pack_bla(bla: BLATable, double: bool):
     arr["Ae"] = bla.Ae
     arr["Be"] = bla.Be
     arr["logR"] = np.clip(bla.logR, -1e30, 1e30).astype(np.float32)
+    # skip length, and the top bit set on the longest skip of a chain (the lookup's end)
+    arr["len"] = bla.steps.astype(np.uint32) | (bla.last.astype(np.uint32) << np.uint32(31))
     qa = None
     if getattr(bla, "order", 1) == 2 and bla.Cm is not None:
         qa = np.zeros(bla.size, dtype=BLAQ_DTYPE[double])
@@ -207,51 +224,30 @@ def _pack_bla(bla: BLATable, double: bool):
     return arr, qa
 
 
-def _levels(bla: BLATable, arr, base: int = 0):
-    """(levels, offsets[32], counts[32], largest radius of the shortest stored skips)."""
-    levels = min(bla.levels, 32)
-    offsets = [int(o) + base for o in (list(bla.offsets) + [0] * 32)[:32]]
-    counts = [int(c) for c in (list(bla.counts) + [0] * 32)[:32]]
-    for j in range(bla.lev0):
-        counts[j] = 0
-    max_logR = -1e30
-    # radii only shrink when entries are merged: the lowest stored level holds the largest
-    # one -> the kernel skips table lookups for deltas above it
-    if levels > bla.lev0 and counts[bla.lev0] > 0:
-        o = offsets[bla.lev0] - base
-        lev = arr["logR"][o:o + counts[bla.lev0]]
-        max_logR = float(np.max(lev)) if lev.size else -1e30
-    return levels, offsets, counts, max_logR
-
-
 class GPUBla:
     def __init__(self, ctx: moderngl.Context, bla: BLATable | None, double: bool, bla_a: BLATable | None = None):
-        """bla_a (Julia sets): the table of reference A, stored in front of `bla` (reference B)."""
+        """bla_a (Julia sets): the table of reference A, stored in front of `bla` (reference B)
+        (GPURef.pair numbers B's skips accordingly)."""
         dt = BLA_DTYPE[double]
         self.table = bla
         self.order = 1
         self.qbuf = None
-        self.levels_a, self.offsets_a, self.counts_a, self.max_logR_a = 0, [0] * 32, [0] * 32, -1e30
+        self.size_a, self.max_logR_a, self.sig_a = 0, -1e30, None
+        self.size, self.max_logR, self.sig, self.lev0 = 0, -1e30, None, None
         parts, qparts = [], []
-        base = 0
         if bla_a is not None and bla_a.size > 0:
             arr_a, qa_a = _pack_bla(bla_a, double)
-            self.levels_a, self.offsets_a, self.counts_a, self.max_logR_a = _levels(bla_a, arr_a)
+            self.size_a, self.max_logR_a, self.sig_a = bla_a.size, bla_a.max_logR, bla_a.signature
             parts.append(arr_a)
             qparts.append(qa_a)
-            base = bla_a.size
-        if bla is None or bla.size == 0:
-            parts.append(np.zeros(1, dtype=dt))
-            qparts.append(None)
-            self.levels, self.lev0, self.offsets, self.counts, self.max_logR = 0, 0, [0] * 32, [0] * 32, -1e30
-            if bla_a is not None and bla_a.size > 0:
-                self.lev0 = bla_a.lev0
-        else:
+        if bla is not None and bla.size > 0:
             arr, qa = _pack_bla(bla, double)
-            self.lev0 = bla.lev0
-            self.levels, self.offsets, self.counts, self.max_logR = _levels(bla, arr, base)
+            self.size, self.max_logR, self.sig, self.lev0 = bla.size, bla.max_logR, bla.signature, bla.lev0
             parts.append(arr)
             qparts.append(qa)
+        if not parts:
+            parts.append(np.zeros(1, dtype=dt))
+            qparts.append(None)
         arr = np.concatenate(parts)
         self.buf = ctx.buffer(arr.tobytes())
         self.nbytes = arr.nbytes
@@ -262,6 +258,19 @@ class GPUBla:
             self.qbuf = ctx.buffer(qa.tobytes())
             self.nbytes += qa.nbytes
             self.order = 2
+
+    @property
+    def levels(self) -> int:
+        """(compatibility) > 0 when there are skips."""
+        return 1 if (self.size or self.size_a) else 0
+
+    def fits(self, gref: "GPURef") -> tuple[bool, bool]:
+        """(table of A, table of B) usable with this reference upload: the skip indices in
+        the reference buffer are those of the same structure (same orbit length and blocks)."""
+        b = (self.size > 0 and self.sig == gref.la_sig
+             and self.size_a == gref.la_nodes_a)          # (B's skips are numbered after A's)
+        a = self.size_a > 0 and gref.len_a > 0 and self.sig_a == gref.la_sig_a
+        return a, b
 
     def release(self):
         self.buf.release()
@@ -644,8 +653,9 @@ class EngineOptions:
     chunk_start: int = 65536              # samples per dispatch at the start of every sweep
     chunk_min: int = 8192                 # never smaller (v3.0 went down to 64 and kept it)
     runs: bool = True                     # plain-float iteration runs without per-step bookkeeping
-    run_length: int = 32                  # iterations per run (derivatives grow <= 4x per iteration;
-                                          # RTX bench: 32 beat 16 by 0-6 %)
+    run_length: int = 16                  # iterations per run (derivatives grow <= 4x per iteration;
+                                          # RTX bench: 32 beat 16 by 0-6 % with the old skips; with the
+                                          # skip tree 16 wins: p6006 682 vs 848 ms, p153231 333 vs 362)
     staged_counters: bool = True          # CPU reads/writes small GPU buffers through a copy
     predictive_budget: bool = True        # stop before a dispatch that would overrun the time slice
     sync_before_step: bool = True         # time slices measure only the field's own dispatches
@@ -1170,22 +1180,17 @@ class Field:
             _setc(prog, "uBlaFast", 1 if self.engine.opt.bla_fast else 0)
             _setc(prog, "uBlaBackoff", 1 if self.engine.opt.bla_backoff else 0)
             _setc(prog, "uBlaPrefilter", 1 if self.engine.opt.bla_prefilter else 0)
-            _setc(prog, "uLev0", int(gb.lev0))
-            _setc(prog, "uLevels", int(gb.levels if prm.use_bla else 0))
-            _setc(prog, "uLevOff", tuple(int(v) for v in gb.offsets))
-            _setc(prog, "uLevCnt", tuple(int(v) for v in gb.counts))
-            _setc(prog, "uUseBla", 1 if (prm.use_bla and gb.levels > 0) else 0)
+            fa, fb = gb.fits(self.gref) if self.gref is not None else (False, False)
+            fa, fb = fa and prm.use_bla, fb and prm.use_bla
+            _setc(prog, "uBlaA", 1 if fa else 0)
+            _setc(prog, "uBlaB", 1 if fb else 0)
+            _setc(prog, "uUseBla", 1 if (fa or fb) else 0)
             _setc(prog, "uBlaMaxLogR", float(gb.max_logR) if self.engine.opt.bla_gate else 1e30)
-            _setc(prog, "uLevelsA", int(gb.levels_a if prm.use_bla else 0))
-            _setc(prog, "uLevOffA", tuple(int(v) for v in gb.offsets_a))
-            _setc(prog, "uLevCntA", tuple(int(v) for v in gb.counts_a))
             _setc(prog, "uBlaMaxLogRA", float(gb.max_logR_a) if self.engine.opt.bla_gate else 1e30)
-            if prm.use_bla and gb.levels_a > 0:
-                _setc(prog, "uUseBla", 1)
         else:
             _setc(prog, "uUseBla", 0)
-            _setc(prog, "uLevels", 0)
-            _setc(prog, "uLevelsA", 0)
+            _setc(prog, "uBlaA", 0)
+            _setc(prog, "uBlaB", 0)
         if self.program is not None and hasattr(self, "extra_uniforms"):
             for k, v in self.extra_uniforms.items():
                 _setc(prog, k, v)
