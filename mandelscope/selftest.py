@@ -18,6 +18,7 @@ from imgui_bundle import hello_imgui
 from gmpy2 import mpfr
 
 from .mp import View
+from . import ride as ride_mod
 from .renderer import ColorSettings
 from .app import InputSnapshot
 
@@ -282,6 +283,23 @@ class SelfTest:
             a.stream_after = 0.5
             a.settings.auto_iter = True
             a.manual_max_iter = None
+
+        def until(cond, timeout):
+            def f():
+                return cond() or time.perf_counter() - st.t_step > timeout
+            return f
+
+        def ride_check():
+            r = a.ride
+            info = {"active": r is not None}
+            if r is not None:
+                t = r["target"]
+                re, im, log2r, ang = ride_mod.framing(t)
+                v = a.view
+                info.update(stage=r["stage"], period=int(t["period"]), log2_size=round(float(t["log2_size"]), 2),
+                            at_target=abs(v.log2r - log2r) < 1e-6 and a._same_place(v, View(re, im, log2r, v.angle), H, 1.0),
+                            next_period=int(r["next"]["period"]) if r["next"] else r["next"])
+            st.record("ride", **info)
 
         def tap(key, shift=False):
             def f():
@@ -724,6 +742,35 @@ class SelfTest:
             ("stream_first", stream_first),
             ("stream_done", wait_done("26_stream")),
             ("stream_check", act(stream_check)),
+            # the free ride (F): a search, a flight to a minibrot, a rest there, Esc stops it
+            ("ride_home", act(lambda: (a.set_view(a.apply_auto_iter(a.home_view())),
+                                       setattr(a.settings, "ride_speed", 4.0), setattr(a.settings, "ride_hold", 60.0)))),
+            ("ride_home_done", wait_done("27_ride_start")),
+            ("ride_on", tap("f")),
+            ("ride_search", until(lambda: a.ride is None or a.ride["stage"] != "search", 120)),
+            ("ride_fly_frames", frames(3)),
+            ("ride_fly", act(lambda: (st.record("ride_flight", stage=a.ride and a.ride["stage"],
+                                                period=a.ride and int(a.ride["target"]["period"]),
+                                                full_res=a.field is not None and a.field.W == a.fb[0]),
+                                      st.shot("27a_ride_flight")))),
+            ("ride_arrive", until(lambda: a.ride is None or a.ride["stage"] == "hold", 600)),
+            ("ride_rest", wait_done("27b_ride_minibrot")),
+            ("ride_next", until(lambda: a.ride is None or a.ride["next"] is not None, 300)),
+            ("ride_rec", act(ride_check)),
+            ("ride_stop", tap("escape")),
+            ("ride_stop_frames", frames(2)),
+            ("ride_stopped", act(lambda: st.record("ride_stopped", ride=a.ride is not None))),
+            # full screen (F11) and back
+            ("fs_size", act(lambda: stash.update(fb=a.fb))),
+            ("fs_on", tap("f11")),
+            ("fs_frames", frames(10)),
+            ("fs_done", wait_done("28_fullscreen")),
+            ("fs_rec", act(lambda: st.record("fullscreen", active=a.fullscreen is not None and a.fullscreen.active(),
+                                             fb=a.fb, before=stash["fb"]))),
+            ("fs_off", tap("f11")),
+            ("fs_off_frames", frames(10)),
+            ("fs_off_rec", act(lambda: st.record("windowed", active=a.fullscreen is not None and a.fullscreen.active(),
+                                                 fb=a.fb))),
             ("end_frames", frames(2)),
         ]
 

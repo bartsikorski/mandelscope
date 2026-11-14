@@ -32,7 +32,7 @@ def test_scripted_gui_session(tmp_path):
              "07_spiral_1e-100", "08_colour_tab", "09_look_ember", "10_stripes", "11_deep_1e-1000",
              "12_deep_f64", "13_library_tab", "14_animate_tab", "15_playback", "16_export_tab",
              "17_seahorse", "18_minibrot", "19_back", "20_help", "21_context_menu", "22_clean_view",
-             "23_classic_style", "24_welcome", "25_controller"]
+             "23_classic_style", "24_welcome", "25_controller", "27_ride_start", "28_fullscreen"]
     for shot in shots:
         assert (tmp_path / f"{shot}.png").exists(), shot
     for name in shots[:13]:
@@ -115,4 +115,20 @@ def test_scripted_gui_session(tmp_path):
     assert steps["22e_back_to_mandelbrot"]["complete"]
     for shot in ("19a_julia_preview", "19b_julia_set", "19c_julia_zoom", "19d_julia_pan", "19f_back_to_mandelbrot"):
         assert (tmp_path / f"{shot}.png").exists(), shot
+    # the free ride: a flight at full resolution to a minibrot, a rest there with the next one
+    # found meanwhile and the reference at the nucleus (a periodic orbit), Esc stops it
+    fl = steps["ride_flight"]
+    assert fl["stage"] == "fly" and fl["period"] > 1 and fl["full_res"], fl
+    rd = steps["ride"]
+    assert rd["active"] and rd["stage"] == "hold" and rd["at_target"], rd
+    assert rd["next_period"] and rd["next_period"] % rd["period"] == 0, rd
+    assert steps["27b_ride_minibrot"]["complete"] and steps["27b_ride_minibrot"]["zoom"] > 2
+    assert not steps["ride_stopped"]["ride"]
+    for shot in ("27a_ride_flight", "27b_ride_minibrot"):
+        assert (tmp_path / f"{shot}.png").exists(), shot
+    # full screen (F11) covers the screen (Xvfb: 1400x900) and F11 again restores the window
+    fs, wn = steps["fullscreen"], steps["windowed"]
+    if fs["active"] is not None:
+        assert fs["active"] and tuple(fs["fb"]) != tuple(fs["before"]), fs
+        assert not wn["active"] and tuple(wn["fb"]) == tuple(fs["before"]), (fs, wn)
     assert "internal error" not in r.stdout, r.stdout[-3000:]

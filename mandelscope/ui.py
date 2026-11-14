@@ -370,6 +370,9 @@ def _toolbar(app, W):
     if icon_button(fa.ICON_FA_CROSSHAIRS, "Find the nearest minibrot (M at the cursor)"):
         app.find_minibrot_at(app.view.re, app.view.im)
     imgui.same_line()
+    if icon_button(fa.ICON_FA_SHUTTLE_SPACE, "Free ride: a slow flight from minibrot to minibrot (F)", app.ride is not None):
+        app.toggle_ride()
+    imgui.same_line()
     if icon_button(fa.ICON_FA_BOOKMARK, "Save this location to the library"):
         app.save_to_library("")
     imgui.same_line(0, 14 * S)
@@ -662,6 +665,7 @@ def _tab_explore(app):
         app.find_minibrot_at(v.re, v.im)
     help_marker("Ball-period detection + Newton's method find the nearest small copy\n"
                 "of the set. Press M to search under the mouse cursor.")
+    _ride_section(app)
     if app.minibrot_job is not None:
         imgui.same_line()
         imgui.text_disabled("searching...")
@@ -673,6 +677,34 @@ def _tab_explore(app):
             app.go_minibrot(r)
     imgui.spacing()
     imgui.text_disabled(f"history: {len(app.history)} back, {len(app.future)} forward")
+
+
+def _ride_section(app):
+    s = app.settings
+    section("Free ride", fa.ICON_FA_ROUTE)
+    on = app.ride is not None
+    if imgui.button((fa.ICON_FA_STOP + "  Stop the free ride") if on else (fa.ICON_FA_PLAY + "  Free ride from here"),
+                    V2(-1, 0)):
+        app.toggle_ride()
+    help_marker("A slow, endless flight (F): to a minibrot near the view, a rest there while\n"
+                "the picture sharpens, then into one of the small copies inside it, and so on.\n"
+                "When the minibrots get too deep it flies back out and takes another branch.\n"
+                "Any zoom, pan, click or key of the camera stops it.  F11: full screen,\n"
+                "Tab: hide the panels.")
+    if on and app.ride.get("target") is not None:
+        t = app.ride["target"]
+        imgui.text_disabled(f"{'to' if app.ride['stage'] == 'fly' else 'at'} period {int(t['period']):,}"
+                            f"   size 10^{float(t['log2_size']) * 0.30103:.1f}")
+    imgui.push_item_width(-150 * S)
+    _, s.ride_speed = imgui.slider_float("speed##ride", s.ride_speed, 0.05, 2.0, "%.2f octaves/s",
+                                         imgui.SliderFlags_.logarithmic)
+    _, s.ride_hold = imgui.slider_float("rest at each##ride", s.ride_hold, 0.0, 30.0, "%.0f s")
+    imgui.pop_item_width()
+    _, s.ride_turn = imgui.checkbox("turn minibrots upright##ride", s.ride_turn)
+    _, s.ride_full_res = imgui.checkbox("full resolution while flying##ride", s.ride_full_res)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("On: every picture of the flight at full resolution (sharper; at heavy places\n"
+                          "the motion may lag).  Off: the usual setting 'while moving' applies.")
 
 
 def _scale_iter(app, k):
@@ -1719,6 +1751,7 @@ SHORTCUTS = [
     ("H", "home (whole set)"),
     ("Backspace", "back (Shift: forward)"),
     ("M", "find the minibrot (or mini ship) under the cursor"),
+    ("F", "free ride: a slow, endless flight from minibrot to minibrot (any key or click stops)"),
     ("B", "Burning Ship / Mandelbrot set"),
     ("J", "Julia set preview on / off (exploring one: back to the Mandelbrot set)"),
     ("Shift+J", "explore the Julia set of the point under the cursor"),
@@ -1731,6 +1764,7 @@ SHORTCUTS = [
     ("F12", "screenshot (2x supersampled PNG)"),
     ("Ctrl+C / Ctrl+V", "copy / paste the location"),
     ("Tab", "hide / show all panels"),
+    ("F11", "full screen on / off (Esc also leaves it)"),
     ("F1", "this help"),
 ]
 
@@ -1807,6 +1841,8 @@ def _context_menu(app):
             if app.julia_c is None:
                 if imgui.menu_item(fa.ICON_FA_MAGNIFYING_GLASS + "  Find a minibrot here", "M", False)[0]:
                     app.find_minibrot_at(cre, cim)
+                if imgui.menu_item(fa.ICON_FA_ROUTE + "  Free ride from here", "F", app.ride is not None)[0]:
+                    app.toggle_ride()
                 if imgui.menu_item(fa.ICON_FA_SNOWFLAKE + "  Explore the Julia set of this point", "Shift+J", False)[0]:
                     app.enter_julia(cre, cim)
                 if imgui.menu_item(fa.ICON_FA_THUMBTACK + "  Put the reference orbit here", "", False)[0]:
@@ -1825,4 +1861,7 @@ def _context_menu(app):
                 imgui.set_clipboard_text(json.dumps(app.location_dict(), indent=1))
             if imgui.menu_item(fa.ICON_FA_ROTATE_LEFT + "  Rotation to 0°", "0", False)[0]:
                 app.rotate_to(0.0)
+            fs = app.fullscreen is not None and app.fullscreen.active()
+            if imgui.menu_item(fa.ICON_FA_EXPAND + "  Full screen", "F11", fs)[0]:
+                app.toggle_fullscreen()
         imgui.end_popup()

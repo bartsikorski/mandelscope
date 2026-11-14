@@ -639,6 +639,35 @@ within 2 % of the plain picture (the counts are chaotic there: float32 rounding 
 most of them).  `test_bla_skips_match_perturbation` checks random stored skips against plain
 perturbation and `test_skips_are_cut_at_near_zero_points` the cuts.
 
+### Free ride and full screen
+
+The free ride (F, `ride.py`) is a chain of transitions, one per minibrot.  Each target is a
+copy of one of 17 small minibrots of the whole set (`LOCAL_MINIS`, periods 3-15, upper half
+plane and mirror images) inside the current one: by tuning, the copy of the period-q minibrot
+w inside a period-p minibrot with nucleus n and complex size s (`size_estimate`) has period
+p q and lies near n + s w.  Newton's method for period p q starts there; the result is kept
+when it is within 2^-1.5 |s| of n + s w and its size is within 1.5 octaves of |s| |size(w)|.
+The linear map is off by up to 0.2 in w for antenna minibrots, while another nucleus of the
+same period would be further away or of another size.  (The first attempt, the ball-period
+finder at points of interest such as the seahorse valley, often found bulbs or let Newton run
+far away.)  From the home view the chains reach period 20,000-80,000 at 10^15-10^20 in 4-7
+legs; every search takes under a second up to period 10^5 (in the worker, one leg ahead).
+Past period 120,000 the ride flies back to the whole set (4x faster) and draws again.
+
+The view at a minibrot is the home view mapped by w -> n + s w: centred at n - 0.75 s, half
+height 1.35 |s|, turned by arg s, so every minibrot appears upright and the same size.  A leg
+is the log-spiral interpolation of `sequence.py` (constant perceived zoom speed) with a
+trapezoidal speed profile: 3 s from rest to the cruising speed (0.4 octaves/s by default) and
+3 s back to rest.  The transition carries `curve: "ride"`, so `_view_after` predicts the
+camera exactly and the reference is put at the target's nucleus (a periodic orbit).  While
+flying, the pictures are computed at full resolution (`ride_full_res`); the rest at each
+minibrot (4 s) lets anti-aliasing finish.  Camera input (wheel, clicks, navigation keys, a
+controller) ends the ride; the panels stay usable.
+
+Full screen (F11, `window.py`) uses GLFW through ctypes like the controller support:
+`glfwSetWindowMonitor` on the monitor that the window overlaps most, at its current video
+mode (no mode switch), with auto-iconify off; leaving it restores the windowed rectangle.
+
 ## 6. Possible next steps
 
 * BLA for the Burning Ship (skips are valid only while the deltas change no signs).
