@@ -1,4 +1,4 @@
-"""Background worker process for reference orbits, BLA tables and minibrot search.
+"""Background worker process for reference orbits, BLA tables, minibrot search and free-ride targets.
 
 gmpy2 loops hold the GIL, so they run in a separate (spawned) process; the UI
 thread only polls a queue.  Jobs can be cancelled; stale results are dropped
@@ -146,6 +146,9 @@ def _worker_main(req_q, res_q, cancel_val):
                     out["re"] = to_str(r["re"], r["prec"])
                     out["im"] = to_str(r["im"], r["prec"])
                     res_q.put({"id": jid, "kind": "minibrot", "result": out})
+            elif kind == "ride":
+                from .ride import plan
+                res_q.put({"id": jid, "kind": "ride", "result": plan(job, cancelled)})
             else:
                 res_q.put({"id": jid, "kind": "error", "error": f"unknown job {kind}"})
         except Exception:
@@ -173,6 +176,11 @@ class Worker:
                 self.cancel_val.value = jid - 1
         self.req_q.put({"id": jid, "kind": kind, **kw})
         return jid
+
+    def cancel(self, jid: int):
+        """Cancel the jobs up to `jid` (a later submit starts afresh)."""
+        with self.cancel_val.get_lock():
+            self.cancel_val.value = max(self.cancel_val.value, jid)
 
     def cancel_all(self):
         with self.cancel_val.get_lock():

@@ -422,6 +422,9 @@ def _icon_row(app, W):
     if _ghost(fa.ICON_FA_CROSSHAIRS, "Find the nearest minibrot (M at the cursor)"):
         app.find_minibrot_at(app.view.re, app.view.im)
     imgui.same_line()
+    if _ghost(fa.ICON_FA_SHUTTLE_SPACE, "Free ride: a slow flight from minibrot to minibrot (F)", app.ride is not None):
+        app.toggle_ride()
+    imgui.same_line()
     ship = app.formula == "ship"
     if _ghost(fa.ICON_FA_SAILBOAT, "Back to the Mandelbrot set (B)" if ship else "The Burning Ship (B)", ship):
         app.set_formula("mandelbrot" if ship else "ship")
@@ -447,6 +450,10 @@ def _icon_row(app, W):
     imgui.same_line()
     if _ghost(fa.ICON_FA_CAMERA, "Screenshot, 2x supersampled (F12)"):
         app.start_still(quick=True)
+    imgui.same_line()
+    fs = app.fullscreen is not None and app.fullscreen.active()
+    if _ghost(fa.ICON_FA_COMPRESS if fs else fa.ICON_FA_EXPAND, "Leave full screen (F11)" if fs else "Full screen (F11)", fs):
+        app.toggle_fullscreen()
     _bar_sep()
     if _ghost(fa.ICON_FA_PAUSE if app.playing else fa.ICON_FA_PLAY, "Play / pause the timeline (Space)", app.playing):
         app.toggle_play()

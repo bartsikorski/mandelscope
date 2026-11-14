@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import sys
 import time
 import traceback
@@ -35,6 +36,7 @@ from .bla import build_bla, structure_for
 from .control import (ZOOM_OMEGA, spring_step, UNDECIDED_OK, iteration_advice, FramePacer,  # noqa: F401
                       auto_motion_level, PadInput, pad_controls)
 from . import software
+from . import ride as ride_mod
 
 CONFIG_DIR = Path(os.environ.get("APPDATA") or Path.home() / ".config") / "mandelscope"
 LEGACY_CONFIG_DIR = CONFIG_DIR.parent / "deepzoom"        # pre-release name: settings are read once
@@ -116,6 +118,11 @@ class Settings:
     pad_speed: float = 1.0           # controller speed factor (pan, zoom, turn)
     pad_deadzone: float = 0.15       # stick dead zone (0..0.5)
     pad_invert_zoom: bool = False    # right stick: down = zoom in
+    fullscreen: bool = False         # F11; the next start opens full screen again
+    ride_speed: float = 0.4          # free ride (F): octaves per second at cruising speed
+    ride_hold: float = 4.0           # free ride: seconds of rest at each minibrot (the picture sharpens)
+    ride_turn: bool = True           # free ride: turn each minibrot upright on the way
+    ride_full_res: bool = True       # free ride: full resolution while flying (no half-resolution zooms)
 
 
 @dataclass
@@ -139,13 +146,13 @@ class InputSnapshot:
 KEYMAP = {"z": imgui.Key.z, "x": imgui.Key.x, "w": imgui.Key.w, "a": imgui.Key.a, "s": imgui.Key.s,
           "d": imgui.Key.d, "q": imgui.Key.q, "e": imgui.Key.e, "h": imgui.Key.h, "k": imgui.Key.k,
           "r": imgui.Key.r, "p": imgui.Key.p, "m": imgui.Key.m, "t": imgui.Key.t, "c": imgui.Key.c,
-          "v": imgui.Key.v, "j": imgui.Key.j, "b": imgui.Key.b,
+          "v": imgui.Key.v, "j": imgui.Key.j, "b": imgui.Key.b, "f": imgui.Key.f,
           "space": imgui.Key.space, "home": imgui.Key.home, "backspace": imgui.Key.backspace,
           "left": imgui.Key.left_arrow, "right": imgui.Key.right_arrow, "up": imgui.Key.up_arrow,
           "down": imgui.Key.down_arrow, "plus": imgui.Key.equal, "kp_plus": imgui.Key.keypad_add,
           "minus": imgui.Key.minus, "kp_minus": imgui.Key.keypad_subtract,
           "lbracket": imgui.Key.left_bracket, "rbracket": imgui.Key.right_bracket, "zero": imgui.Key._0,
-          "tab": imgui.Key.tab, "f1": imgui.Key.f1, "f12": imgui.Key.f12, "escape": imgui.Key.escape,
+          "tab": imgui.Key.tab, "f1": imgui.Key.f1, "f11": imgui.Key.f11, "f12": imgui.Key.f12, "escape": imgui.Key.escape,
           "pageup": imgui.Key.page_up, "pagedown": imgui.Key.page_down}
 
 
@@ -555,6 +562,9 @@ class App:
         self.formula_saved: dict = {}
         self.mouse = (0.0, 0.0, True)          # last mouse position, over the UI?
         self.jpreview = None
+        self.ride: dict | None = None            # free ride state (F), see toggle_ride
+        self.fullscreen = None                   # window.FullScreen (made in post_init: needs GLFW)
+        self._fullscreen_pending = bool(self.settings.fullscreen) and not self.selftest_mode
         self._sync_edit_fields()
 
     # ================================================================ config
@@ -743,6 +753,12 @@ class App:
         except Exception as e:
             print(f"controller support off: {e}", flush=True)
             self.gamepad = None
+        try:
+            from .window import FullScreen
+            self.fullscreen = FullScreen(hello_imgui.get_glfw_window_address())
+        except Exception as e:
+            print(f"full screen off: {e}", flush=True)
+            self.fullscreen = None
         self.video_worker = None
         self.screen_tex = self.prev_tex = self.accum_tex = None
         self.scratch_tex = self.scratch_fbo = None
@@ -783,6 +799,12 @@ class App:
 
     def before_exit(self):
         try:
+            if self.fullscreen is not None and not self.selftest_mode:
+                # remembered for the next start; the window first gets its windowed size back,
+                # which hello_imgui then stores as the window's geometry
+                self.settings.fullscreen = self.fullscreen.active()
+                if self.settings.fullscreen:
+                    self.fullscreen.set(False)
             if self.live:
                 self.live.close()
             for j in self.jobs:
@@ -1129,9 +1151,17 @@ class App:
                 self.ui_visible = not self.ui_visible
             if "f1" in p:
                 self.show_help = not self.show_help
+            if "f11" in p:
+                self.toggle_fullscreen()
+            if "f" in p and not inp.ctrl:
+                self.toggle_ride()
             if "f12" in p:
                 self.start_still(quick=True)
             if "escape" in p:
+                if self.ride is not None:
+                    self.stop_ride()
+                elif self.fullscreen is not None and not self.show_help and self.fullscreen.active():
+                    self.toggle_fullscreen()
                 self.show_help = False
                 self.stop_inertia()
                 self.zoom_anim = 0.0
@@ -1190,13 +1220,14 @@ class App:
         if self.transition is not None:
             tr = self.transition
             u = min(1.0, (self.anim_now - tr["t0"]) / tr["dur"])
-            v = interpolate_views(tr["v0"], tr["v1"], ease("smooth", u))
+            v = interpolate_views(tr["v0"], tr["v1"], self._transition_u(tr, self.anim_now))
             if not self.settings.auto_iter:
                 v.max_iter = tr["v1"].max_iter
             else:
                 v = self.apply_auto_iter(v)
             moved = True
             if u >= 1.0:
+                tr["done"] = True
                 v = tr["v1"].copy()
                 v.angle = math.remainder(v.angle, 2 * math.pi)     # 0 deg, not 360 deg, after turning back
                 if self.settings.auto_iter:
@@ -1208,6 +1239,14 @@ class App:
             self._sync_edit_fields()
             if self.playing and (inp.down[0] or inp.down[1] or inp.wheel):
                 self.playing = False
+
+    @staticmethod
+    def _transition_u(tr: dict, t: float) -> float:
+        """Interpolation parameter of a transition at camera time t: smooth start and end, or
+        for the legs of the free ride a constant zoom speed between short ramps."""
+        if tr.get("curve") == "ride":
+            return ride_mod.leg_progress(t - tr["t0"], tr["dur"], tr["ramp"])
+        return ease("smooth", min(1.0, (t - tr["t0"]) / tr["dur"]))
 
     def _apply_pan(self, v: View, dx: float, dy: float, acc: list):
         """Move the content by (dx, dy) screen pixels using whole field samples (reusable)."""
@@ -1479,6 +1518,14 @@ class App:
                 elif kind == "error":
                     self.pending_bla = None
         for msg in self.aux_worker.poll():
+            if self.ride is not None and msg["id"] == self.ride.get("job"):
+                if msg["kind"] == "ride":
+                    self._ride_result(msg["result"])
+                elif msg["kind"] == "error":
+                    if DEBUG:
+                        print(msg.get("error", ""), flush=True)
+                    self._ride_result({"target": None, "parent": None})
+                continue
             if self.minibrot_job and msg["id"] == self.minibrot_job:
                 if msg["kind"] == "minibrot":
                     self.minibrot_job = None
@@ -1653,8 +1700,7 @@ class App:
             return self.sequence.view_at(min(self.play_t + tau, self.sequence.end))[0]
         if self.transition is not None:
             tr = self.transition
-            u = min(1.0, (self.anim_now + tau - tr["t0"]) / tr["dur"])
-            return self.apply_auto_iter(interpolate_views(tr["v0"], tr["v1"], ease("smooth", u)))
+            return self.apply_auto_iter(interpolate_views(tr["v0"], tr["v1"], self._transition_u(tr, self.anim_now + tau)))
         if abs(self.zoom_anim) > 1e-4 and self.zoom_focus is not None:
             if self.settings.wheel_spring:
                 rem = self.zoom_anim - spring_step(self.zoom_anim, self.zoom_vel, tau, ZOOM_OMEGA)[0]
@@ -1774,6 +1820,8 @@ class App:
         scale = s.render_scale
         if moving:
             ms = s.motion_scale if s.motion_scale > 0 else self._auto_motion_scale()
+            if self.ride is not None and s.ride_full_res and self.transition is not None:
+                ms = 1.0          # the free ride is slow: every picture at full resolution
             scale = min(scale, max(ms, 0.25))
         double = self.delta_precision()
         Wf, Hf = self._field_dims(scale)
@@ -2261,6 +2309,9 @@ class App:
         H = int(io.display_size.y * self.fb_scale[1])
         if W < 16 or H < 16:
             return
+        if self._fullscreen_pending and self.fullscreen is not None:
+            self._fullscreen_pending = False
+            self.fullscreen.set(True)
         if (W, H) != self.fb:
             first = self.fb == (0, 0)
             self.fb = (W, H)
@@ -2279,7 +2330,10 @@ class App:
         self.anim_dt = dt
         inp = self.selftest.input() if self.selftest else read_input(self.fb_scale)
         inp.pad = self._read_pad()
+        if self.ride is not None and self._user_moves(inp):
+            self.stop_ride()
         self.handle_input(inp, dt)
+        self._step_ride()
         if self.playing:
             self._advance_playback(dt)
         self._track_motion(dt)
@@ -2352,6 +2406,7 @@ class App:
         if f is None or not f.complete or job_running or self.is_moving():
             return False
         if (self.live is not None or self.path_rec is not None or self.pending_ref is not None
+                or self.ride is not None
                 or self.pending_bla is not None or self.minibrot_job is not None):
             return False
         if self.colors.cycle_speed != 0.0 or self.colour_tab_visible:
@@ -2754,6 +2809,8 @@ class App:
 
     # ============================================================= minibrot
     def find_minibrot_at(self, cre, cim):
+        if self.ride is not None:
+            self.stop_ride()                # (the search would cancel the ride's own)
         if self.julia_c is not None:
             self.notify("minibrots are in the Mandelbrot set (J: back to it)")
             return
@@ -2772,6 +2829,152 @@ class App:
         self._adopt_iterations(v)
         self.ref_anchor = v.copy()
         self.go_to(v, 0.8)
+
+    # ============================================================= free ride
+    RIDE_RAMP = 3.0          # s: speeding up from rest / slowing down to rest on each leg
+    RIDE_OUT_SPEED = 4.0     # flying back out to the whole set: this many times faster
+
+    def toggle_ride(self):
+        """F: start / stop the free ride - a slow, endless flight from minibrot to minibrot
+        (ride.py): to one near the view, then into ever smaller copies inside it."""
+        if self.ride is not None:
+            self.stop_ride()
+            return
+        if self.julia_c is not None or self.formula != "mandelbrot":
+            self.notify("the free ride is for the Mandelbrot set (J / B: back to it)")
+            return
+        self.playing = False
+        self.stop_inertia()
+        self.zoom_anim = self.zoom_vel = 0.0
+        self.transition = None
+        self.minibrot_job = None            # (the ride's search replaces it in the worker)
+        v, H = self.view, max(self.fb[1], 256)
+        p = max(v.precision, v.needed_precision(H))
+        rng = random.Random()
+        self.ride = {"stage": "search", "tr": None, "target": None, "next": None,
+                     "hold_until": 0.0, "arrived": None, "rng": rng, "waiting_note": False}
+        self.ride["job"] = self.aux_worker.submit("ride", re=to_str(v.re, p), im=to_str(v.im, p),
+                                                  log2r=v.log2r, seed=rng.random(),
+                                                  max_period=ride_mod.MAX_PERIOD)
+        self.notify("free ride: looking for a minibrot near here (F or Esc stops)")
+
+    def stop_ride(self, note: str = "free ride stopped"):
+        if self.ride is None:
+            return
+        r, self.ride = self.ride, None
+        if r.get("tr") is not None and self.transition is r["tr"]:
+            self.transition = None          # stop where the camera is
+            self.push_history()
+        if r.get("job") is not None:
+            self.aux_worker.cancel(r["job"])
+        if note:
+            self.notify(note)
+
+    @staticmethod
+    def _user_moves(inp: InputSnapshot) -> bool:
+        """Input that steers the camera (it ends the free ride; the panels stay usable)."""
+        if not inp.ui_mouse and (inp.wheel != 0.0 or any(inp.clicked) or inp.double):
+            return True
+        if inp.typing:
+            return False
+        steer = {"z", "x", "w", "a", "s", "d", "q", "e", "left", "right", "up", "down", "plus", "kp_plus",
+                 "minus", "kp_minus", "pageup", "pagedown", "lbracket", "rbracket", "zero", "h", "home",
+                 "backspace"}
+        if inp.pressed & steer:
+            return True
+        pad = inp.pad
+        return pad is not None and getattr(pad, "active", False)
+
+    def _ride_result(self, res: dict):
+        r = self.ride
+        r["job"] = None
+        t = res.get("target")
+        if r["stage"] == "search":
+            if t is None:
+                self.notify("free ride: no minibrot near here - starting from the whole set")
+                self._ride_leg(dict(ride_mod.MAIN_SET), speed_mult=self.RIDE_OUT_SPEED)
+            else:
+                self._ride_leg(t)
+        else:
+            r["next"] = t if t is not None else False
+
+    def _ride_leg(self, target: dict, speed_mult: float = 1.0):
+        """Fly from the current view to the framing of `target`; meanwhile look for the next one."""
+        r, s = self.ride, self.settings
+        W, H = self.fb
+        re, im, log2r, angle = ride_mod.framing(target)
+        v0 = self.view.copy()
+        if not s.ride_turn:
+            angle = v0.angle
+        angle = v0.angle + math.remainder(angle - v0.angle, 2 * math.pi)     # the shorter way round
+        v1 = View(re, im, log2r, angle, max(int(target["period"]) * 20, 1000)).ensure_precision(max(H, 256))
+        self._adopt_iterations(v1)
+        dl = v1.log2r - v0.log2r
+        dx, dy = v0.delta_in_pixels(v1, max(H, 1))
+        heights = math.hypot(dx, dy) / max(H, 1)
+        if dl > 0:
+            heights *= 2.0 ** -dl            # (zooming out: measured in the end view's heights)
+        dur = ride_mod.leg_duration(dl, heights, s.ride_speed * speed_mult, self.RIDE_RAMP)
+        self.push_history()
+        tr = {"v0": v0, "v1": v1, "t0": self.anim_now, "dur": dur, "curve": "ride", "ramp": self.RIDE_RAMP}
+        self.transition = tr
+        prec = int(target.get("prec", 64))
+        self.ref_anchor = View(mpfr(target["re"], prec), mpfr(target["im"], prec), v1.log2r)  # periodic orbit
+        r.update(stage="fly", tr=tr, target=target, next=None, arrived=None, waiting_note=False)
+        r["job"] = self.aux_worker.submit("ride", parent=target, seed=r["rng"].random(),
+                                          max_period=ride_mod.MAX_PERIOD)
+        if int(target["period"]) == 1:
+            self.notify("free ride: to the whole set")
+        else:
+            self.notify(f"free ride: to a period-{int(target['period']):,} minibrot "
+                        f"(zoom 10^{v1.zoom_magnification_log10():.1f}, {dur:.0f} s)")
+
+    def _step_ride(self):
+        r = self.ride
+        if r is None:
+            return
+        if self.formula != "mandelbrot" or self.julia_c is not None or self.playing:
+            self.stop_ride()
+            return
+        if r["stage"] == "fly":
+            if self.transition is r["tr"]:
+                return
+            if not r["tr"].get("done"):
+                self.stop_ride()                     # the flight was interrupted (Esc, a click, ...)
+                return
+            r.update(stage="hold", hold_until=self.anim_now + max(0.0, self.settings.ride_hold),
+                     arrived=self.view.copy())
+            self.push_history()
+        if r["stage"] == "hold":
+            a, v = r["arrived"], self.view
+            if (self.transition is not None or abs(a.log2r - v.log2r) > 1e-6
+                    or not self._same_place(a, v, max(self.fb[1], 1), 0.5)):
+                self.stop_ride()
+                return
+            if self.anim_now < r["hold_until"]:
+                return
+            nxt = r["next"]
+            if nxt is None:                          # still looking (deep minibrots take longer)
+                if not r["waiting_note"]:
+                    r["waiting_note"] = True
+                    self.notify("free ride: looking for the next minibrot...")
+                return
+            if nxt is False:                         # too deep (or nothing found): a new branch
+                if int(r["target"]["period"]) == 1:
+                    self.stop_ride("free ride: no minibrot found")
+                    return
+                self._ride_leg(dict(ride_mod.MAIN_SET), speed_mult=self.RIDE_OUT_SPEED)
+            else:
+                self._ride_leg(nxt)
+
+    # ============================================================ full screen
+    def toggle_fullscreen(self):
+        """F11: full screen on the monitor the window is on, and back."""
+        fs = self.fullscreen
+        if fs is None or not fs.toggle():
+            self.notify("full screen is not available" + (f" ({fs.error})" if fs is not None and fs.error else ""))
+            return
+        self.settings.fullscreen = fs.active()
 
     # ============================================================= library
     def save_to_library(self, name: str):

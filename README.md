@@ -87,6 +87,7 @@ The first start shows the basic controls. **F1** lists every key and controller 
 | **[ / ]**, **0** | rotate 90°, rotation back to 0° |
 | **H**, **Backspace** (Shift: forward) | home, back |
 | **M** | find the minibrot (or mini ship) under the cursor |
+| **F** | free ride: a slow, endless flight from minibrot to minibrot (any camera key or click stops it) |
 | **B** | the Burning Ship / back to the Mandelbrot set |
 | **J** / **Shift+J** | Julia set preview / explore the Julia set under the cursor (J again: back) |
 | **K**, **Space**, **T** | add keyframe, play/pause, show/hide the timeline |
@@ -94,6 +95,7 @@ The first start shows the basic controls. **F1** lists every key and controller 
 | **F12** | screenshot (2× supersampled PNG with the location embedded) |
 | Ctrl+C / Ctrl+V | copy / paste the location |
 | **Tab**, **F1** | hide all panels, help |
+| **F11** | full screen on / off (Esc also leaves it) |
 
 | Controller (PlayStation names; Xbox: A B X Y, LB RB LT RT) | |
 |---|---|
@@ -106,6 +108,8 @@ The first start shows the basic controls. **F1** lists every key and controller 
 | D-pad ← → / ↑ ↓ | previous / next look, more / fewer iterations |
 | L3 / R3 | home / rotation back to 0° |
 | options / create / PS | hide the panels / screenshot / help |
+
+**Free ride.** Press **F** (or the shuttle button, or *Explore → Free ride*) and the camera flies by itself: to a minibrot near the view, rests there while the picture sharpens, then dives into one of the small copies of the set's own minibrots embedded in it, and so on, turning each one upright on the way. When the minibrots get too deep for the iteration limit (period above 120,000) it flies back out to the whole set and takes another branch, chosen at random. It zooms at 0.4 octaves per second by default and computes every picture at full resolution while flying; speed, the rest at each minibrot and both options are under *Explore → Free ride*. **F11** and **Tab** make it a screensaver.
 
 Controllers work over USB or Bluetooth. Speed, dead zone and zoom direction are under *Explore → Controller*.
 
