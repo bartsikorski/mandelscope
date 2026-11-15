@@ -494,3 +494,29 @@ def test_fixed_auto_table():
     assert np.interp(11.0, x, cdf) == pytest.approx(0.5, abs=0.05)   # equal weight per frame
     assert 1.7 < scale < 2.3
     assert fixed_auto_table([np.array([])]) is None
+
+
+def test_worker_results_arrive_through_poll_in_order():
+    """Worker results are received on a thread of the explorer's process (a big message no
+    longer stalls the frame that polls); poll() returns them in the order they were sent and
+    close() ends that thread."""
+    import time
+    from mandelscope.worker import Worker
+    w = Worker()
+    try:
+        j1 = w.submit("reference", cancel_previous=False, re="0", im="1", prec=128, max_iter=200_000,
+                      log2_cmax=-40.0, log2_eps=-24.0)
+        j2 = w.submit("reference", cancel_previous=False, re="-1", im="0", prec=128, max_iter=5000)
+        seen, t0 = [], time.perf_counter()
+        while not any(m["id"] == j2 and m["kind"] == "reference" for m in seen):
+            assert time.perf_counter() - t0 < 120, seen[-3:]
+            seen += w.poll()
+            time.sleep(0.005)
+        done = [(m["id"], m["kind"]) for m in seen if m["kind"] != "progress"]
+        assert done == [(j1, "reference"), (j2, "reference")], done
+        ref = [m for m in seen if m["id"] == j1 and m["kind"] == "reference"][0]["ref"]
+        assert ref.length == 200_001 and [m for m in seen if m["id"] == j1][0]["kind"] in ("progress", "reference")
+        assert w.poll() == []
+    finally:
+        w.close()
+    assert not w._pump.is_alive()

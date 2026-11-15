@@ -59,6 +59,17 @@ def ff_complex(z) -> np.ndarray:
     rh, rl = ff_split(z.real)
     ih, il = ff_split(z.imag)
     return np.stack([rh, ih, rl, il], axis=1)
+
+
+def _ff_complex_into(out: np.ndarray, z) -> None:
+    """ff_complex(z) written into out (float32 [N, 4], may be a column slice)."""
+    z = np.asarray(z, dtype=np.complex128).reshape(-1)
+    for k, x in ((0, z.real), (1, z.imag)):
+        hi, lo = ff_split(x)
+        out[:, k] = hi
+        out[:, k + 2] = lo
+
+
 MAX_GROUPS = 65535
 N_COUNTERS = 12
 
@@ -118,37 +129,38 @@ class GPURef:
         self.ref = ref
         self.base_b, self.len_a, self.len_b = 0, 0, n      # (Julia: see pair())
         self.per_a, self.per_b = 0, int(getattr(ref, "period", 0) or 0)
-        small = (ref.ze.astype(np.int64) <= SMALL_EXP[double]).astype(np.float64)
-        f = np.zeros((n, 4), dtype=np.float64)
-        f[:, 0] = ref.zf.real
-        f[:, 1] = ref.zf.imag
-        f[:, 2] = small
-        f[:, 3] = first[:n]
+        small = ref.ze.astype(np.int64) <= SMALL_EXP[double]
+        # (the arrays are written in their final type and handed to the buffers as they are:
+        # a 3-million-iteration orbit took 170 ms (float32) to 440 ms (float-float) on the UI
+        # thread with float64 staging copies and tobytes(); the bytes are the same)
         if double == PREC_FF:
             # RefQ: (X.hi, Y.hi, X.lo, Y.lo) and (small, first skip, 0, 0); mantissas as float-float
             zf = np.zeros((n, 8), dtype=np.float32)
-            zf[:, 0:4] = ff_complex(ref.zf)
+            _ff_complex_into(zf[:, 0:4], ref.zf)
             zf[:, 4] = small
             zf[:, 5] = first[:n]
-            zm = ff_complex(ref.zm)
-        elif double:
-            zf = f
-            zm = np.ascontiguousarray(ref.zm.astype(np.complex128)).view(np.float64)
+            zm = np.empty((n, 4), dtype=np.float32)
+            _ff_complex_into(zm, ref.zm)
         else:
+            zf = np.zeros((n, 4), dtype=np.float64 if double else np.float32)
             with np.errstate(over="ignore", under="ignore"):
-                zf = f.astype(np.float32)
-                zm = np.ascontiguousarray(ref.zm.astype(np.complex64)).view(np.float32)
-        ze = np.ascontiguousarray(ref.ze.astype(np.int32))
-        self.bf = ctx.buffer(np.ascontiguousarray(zf).tobytes())
-        self.bm = ctx.buffer(zm.tobytes())
-        self.be = ctx.buffer(ze.tobytes())
+                zf[:, 0] = ref.zf.real
+                zf[:, 1] = ref.zf.imag
+                zf[:, 2] = small
+                zf[:, 3] = first[:n]
+                zm = np.ascontiguousarray(ref.zm, dtype=np.complex128 if double else np.complex64)
+            zm = zm.view(np.float64 if double else np.float32)
+        ze = np.ascontiguousarray(ref.ze, dtype=np.int32)
+        self.bf = ctx.buffer(zf)
+        self.bm = ctx.buffer(zm)
+        self.be = ctx.buffer(ze)
         self.nbytes = zf.nbytes + zm.nbytes + ze.nbytes
         self.bxy = None
         if getattr(ref, "xym", None) is not None:
             # Burning Ship: X*Y as (mantissa, exponent) pairs in the delta precision
             xy = np.stack([ref.xym, ref.xye.astype(np.float64)], axis=1)
             xy = np.ascontiguousarray(xy if double else xy.astype(np.float32))
-            self.bxy = ctx.buffer(xy.tobytes())
+            self.bxy = ctx.buffer(xy)
             self.nbytes += xy.nbytes
 
     def release(self):
@@ -249,13 +261,13 @@ class GPUBla:
             parts.append(np.zeros(1, dtype=dt))
             qparts.append(None)
         arr = np.concatenate(parts)
-        self.buf = ctx.buffer(arr.tobytes())
+        self.buf = ctx.buffer(arr)
         self.nbytes = arr.nbytes
         if all(q is not None for q in qparts if q is not None) and any(q is not None for q in qparts):
             qd = BLAQ_DTYPE[double]
             qs = [q if q is not None else np.zeros(len(a), dtype=qd) for q, a in zip(qparts, parts)]
             qa = np.concatenate(qs)
-            self.qbuf = ctx.buffer(qa.tobytes())
+            self.qbuf = ctx.buffer(qa)
             self.nbytes += qa.nbytes
             self.order = 2
 

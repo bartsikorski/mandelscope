@@ -9,6 +9,7 @@ from __future__ import annotations
 import itertools
 import multiprocessing as mp
 import queue
+import threading
 import time
 import traceback
 
@@ -168,6 +169,29 @@ class Worker:
         self.proc.start()
         self._ids = itertools.count(1)
         self.busy_job = None
+        # Results are received on a thread of their own: reading a message from the pipe and
+        # unpickling it takes as long as the message is big (a reference orbit of 3 million
+        # iterations with its skip table is ~140 MB: 220-290 ms), and poll() is called from
+        # the UI thread every frame - it now only takes messages that have fully arrived.
+        self._inbox: queue.Queue = queue.Queue()
+        self._closing = False
+        self._pump = threading.Thread(target=self._receive, daemon=True, name="mandelscope-worker-results")
+        self._pump.start()
+
+    def _receive(self):
+        while not self._closing:
+            try:
+                msg = self.res_q.get(timeout=0.25)
+            except queue.Empty:
+                if not self.proc.is_alive():
+                    break
+                continue
+            except (EOFError, OSError, ValueError):       # the process or queue is gone
+                break
+            except Exception:                              # (a message that cannot be read)
+                traceback.print_exc()
+                continue
+            self._inbox.put(msg)
 
     def submit(self, kind: str, cancel_previous: bool = True, **kw) -> int:
         jid = next(self._ids)
@@ -190,7 +214,7 @@ class Worker:
         out = []
         while True:
             try:
-                out.append(self.res_q.get_nowait())
+                out.append(self._inbox.get_nowait())
             except queue.Empty:
                 break
         return out
@@ -200,7 +224,7 @@ class Worker:
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < timeout:
             try:
-                msg = self.res_q.get(timeout=0.5)
+                msg = self._inbox.get(timeout=0.5)
             except queue.Empty:
                 continue
             if msg["id"] == jid and msg["kind"] != "progress":
@@ -216,3 +240,5 @@ class Worker:
             pass
         if self.proc.is_alive():
             self.proc.terminate()
+        self._closing = True
+        self._pump.join(timeout=1)
