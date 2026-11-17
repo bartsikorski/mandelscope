@@ -144,7 +144,8 @@ Run the benchmark there and pair it with a motion study for displayed frame timi
 * Cached MPFR state stays in the worker via `dataclasses.replace`, instead of
   temporarily clearing/restoring the cached object's state.
 * The parent closes its writer after spawning. Worker death halfway through a
-  result produces EOF, and only complete results reach the UI inbox.
+  result produces an end-of-pipe error (`EOFError`, or `BrokenPipeError` from
+  Windows pipe polling), and only complete results reach the UI inbox.
 * Shutdown cancels, requests exit and terminates if needed, now also joining a
   terminated child and closing IPC handles. Repeated `close` is harmless.
 * Real spawn/IPC tests cover cancellation, partial prefixes, resumed cached state,
@@ -159,3 +160,30 @@ Run the benchmark there and pair it with a motion study for displayed frame timi
 The pre-change non-GUI suite passed **171 tests, 1 skipped**. Patched suite and
 lint results are recorded in the pull request. Display/Xvfb was unavailable
 locally, so the scripted GUI session must run in CI or on a desktop.
+
+## Follow-up: Windows CI and an independent local repeat
+
+The first PR CI run passed on Linux, including the GUI session (187 passed,
+1 skipped). Windows reported 186 passes and one failure in the new low-level
+transport test: after the writer closed, `PipeConnection.poll()` raised
+`BrokenPipeError: [WinError 109] The pipe has been ended`, while the test expected
+only `EOFError`. `Worker._receive` already handles this through its `OSError`
+handler. The test now accepts either end-of-pipe exception. The Windows spawned
+worker, cancellation and interrupted-transfer tests had already passed.
+
+After that test correction, the full local suite again passed 186 tests with
+the same two environment-specific skips, and lint passed. A separate seven-trial
+benchmark repeat, with tests stopped before timing, produced:
+
+| 3M reference | Median complete transfer | Median worst heartbeat gap | Worst gap |
+| --- | ---: | ---: | ---: |
+| PR #7 queue | 790.8 ms | 70.79 ms | 389.46 ms |
+| New pipe | 130.9 ms | 2.44 ms | 11.23 ms |
+| Shared-memory prototype | 61.6 ms | 2.37 ms | 6.19 ms |
+
+At 300k iterations the queue/pipe median worst gaps were 9.21/1.24 ms. All
+payload fields and arrays again matched across transports at both sizes. The
+separate llvmpipe GPU construction medians at 3M were 71.6/111.0/233.2 ms for
+f32/f64/float-float. This is a repeat in the Linux workspace, not an RTX run.
+The spread between runs reinforces the need to report distributions rather than
+one best timing. [Repeat raw measurements](benchmarks/orbit-transfer-linux-rerun.json).

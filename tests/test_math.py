@@ -562,7 +562,9 @@ def test_result_pipe_preserves_arrays_and_bounds_wire_chunks():
     thread.start()
     got = rx.get(timeout=5)
     assert rx.get(timeout=5) == {"kind": "done"}
-    with pytest.raises(EOFError):
+    # Windows poll() can detect a closed named pipe before recv() sees EOF.
+    # The worker treats both exceptions as a normal end of the result stream.
+    with pytest.raises((EOFError, BrokenPipeError)):
         rx.get(timeout=5)
     thread.join(timeout=5)
     rx.close()
