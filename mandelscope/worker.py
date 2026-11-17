@@ -12,6 +12,9 @@ import queue
 import threading
 import time
 import traceback
+from dataclasses import replace
+
+from .transfer import ResultReceiver, ResultSender
 
 
 def _worker_main(req_q, res_q, cancel_val):
@@ -101,11 +104,9 @@ def _worker_main(req_q, res_q, cancel_val):
                     bla = build_bla(ref.zm, ref.ze, job["log2_cmax"], job["log2_eps"],
                                     structure=structure_for(ref, job.get("lev0")))
                     bla.ref_id = jid
-                state = ref.state
-                ref.state = None          # mpc objects stay in the worker
-                res_q.put({"id": jid, "kind": "reference", "ref": ref, "bla": bla,
-                           "resumable": state is not None})
-                ref.state = state
+                # Never mutate the cached orbit to prepare its transmitted snapshot.
+                res_q.put({"id": jid, "kind": "reference", "ref": replace(ref, state=None), "bla": bla,
+                           "resumable": ref.state is not None})
             elif kind == "julia_reference":
                 from .offline import compute_julia_references
                 key = (job["c_re"], job["c_im"])
@@ -122,9 +123,8 @@ def _worker_main(req_q, res_q, cancel_val):
                 julia_b[key] = ref_b
                 for r in (ref_a, ref_b):
                     r.ref_id = jid
-                from dataclasses import replace as _rep
-                res_q.put({"id": jid, "kind": "julia_reference", "ref_a": _rep(ref_a, state=None),
-                           "ref_b": _rep(ref_b, state=None),
+                res_q.put({"id": jid, "kind": "julia_reference", "ref_a": replace(ref_a, state=None),
+                           "ref_b": replace(ref_b, state=None),
                            "bla_a": bla_a, "bla_b": bla_b, "log2_eps": job["log2_eps"]})
             elif kind == "bla":
                 ref = cache.get(job["ref_id"])
@@ -162,17 +162,19 @@ class Worker:
     def __init__(self):
         ctx = mp.get_context("spawn")
         self.req_q = ctx.Queue()
-        self.res_q = ctx.Queue()
+        reader, writer = ctx.Pipe(duplex=False)
+        self.res_q = ResultReceiver(reader)
         self.cancel_val = ctx.Value("q", 0)
-        self.proc = ctx.Process(target=_worker_main, args=(self.req_q, self.res_q, self.cancel_val),
+        self.proc = ctx.Process(target=_worker_main, args=(self.req_q, ResultSender(writer), self.cancel_val),
                                 daemon=True, name="mandelscope-worker")
         self.proc.start()
+        # With no writer in the parent, a child dying halfway through a result
+        # produces EOF instead of leaving the receiving thread blocked forever.
+        writer.close()
         self._ids = itertools.count(1)
         self.busy_job = None
-        # Results are received on a thread of their own: reading a message from the pipe and
-        # unpickling it takes as long as the message is big (a reference orbit of 3 million
-        # iterations with its skip table is ~140 MB: 220-290 ms), and poll() is called from
-        # the UI thread every frame - it now only takes messages that have fully arrived.
+        # poll() only drains complete results. Large numerical buffers bypass pickle
+        # and arrive in bounded chunks so this thread cannot monopolise the UI's GIL.
         self._inbox: queue.Queue = queue.Queue()
         self._closing = False
         self._pump = threading.Thread(target=self._receive, daemon=True, name="mandelscope-worker-results")
@@ -232,6 +234,8 @@ class Worker:
         raise TimeoutError(f"job {jid} timed out")
 
     def close(self):
+        if self._closing:
+            return
         try:
             self.cancel_all()
             self.req_q.put(None)
@@ -240,5 +244,9 @@ class Worker:
             pass
         if self.proc.is_alive():
             self.proc.terminate()
+            self.proc.join(timeout=2)
         self._closing = True
         self._pump.join(timeout=1)
+        self.res_q.close()
+        self.req_q.cancel_join_thread()
+        self.req_q.close()
