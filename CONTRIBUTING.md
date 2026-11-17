@@ -35,6 +35,7 @@ On Windows, `Install Mandelscope.bat` does the same and creates shortcuts.
 ## Guidelines
 
 - **Measure first.** Speed changes come with numbers: `run.bat bench --experiments` (or `--bla` for deep renders), or a motion study plus `tools/analyze_footage.py` for anything you see while moving. Please include the GPU model.
+  For reference-transfer stalls, `uv run python tools/bench_orbit_transfer.py --gpu --shared-memory` separates IPC/GIL pauses from GPU packing/upload; see [the method and measurements](docs/orbit-transfer.md).
 - **Keep pictures exact.** The tests compare GPU results with an MPFR ground truth and with each other (reuse equals a fresh render, BLA on equals off). A speed-up that changes pictures needs a test showing that the difference stays within float precision.
 - **Add a test** for every bug fix and feature. Tests without a GPU go in `tests/test_control.py` or `tests/test_math.py`.
 - **Windows without a GPU:** `run.bat get-mesa` once, then `set MANDELSCOPE_SOFTWARE=1` before `uv run pytest -q` runs the whole suite in CPU mode (that is what the Windows CI job does).

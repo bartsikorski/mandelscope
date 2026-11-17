@@ -17,6 +17,57 @@ from accuracy import render_view, compare, stats
 pytestmark = pytest.mark.gpu
 
 
+@pytest.mark.parametrize("precision", [False, True, 2])
+@pytest.mark.parametrize("kind", ["mandelbrot", "ship", "julia"])
+def test_worker_transport_keeps_gpu_buffers_identical(engine, precision, kind):
+    """Compare every uploaded byte with the previous pickle-based transport."""
+    import multiprocessing as mp
+    import pickle
+    import threading
+    from dataclasses import replace
+    from mandelscope.bla import structure_for
+    from mandelscope.offline import compute_julia_references
+    from mandelscope.transfer import ResultSender, ResultReceiver
+
+    if kind == "julia":
+        req = dict(c_re="0", c_im="1", re="0", im="0", prec=128, max_iter=10000)
+        a, b, ba, bb = compute_julia_references(req, -24.)
+    else:
+        b = compute_reference("0" if kind == "mandelbrot" else "-1.8",
+                              "1" if kind == "mandelbrot" else "-0.02", 128, 100_000, formula=kind)
+        a = ba = None
+        bb = build_bla(b.zm, b.ze, -60., -24., structure=structure_for(b)) if kind == "mandelbrot" else None
+    payload = (replace(a, state=None) if a is not None else None, replace(b, state=None), ba, bb)
+    old = pickle.loads(pickle.dumps(payload, protocol=4))
+    reader, writer = mp.get_context("spawn").Pipe(duplex=False)
+
+    def send():
+        try:
+            ResultSender(writer).put(payload)
+        finally:
+            writer.close()
+
+    thread = threading.Thread(target=send, daemon=True)
+    thread.start()
+    new = ResultReceiver(reader).get(timeout=10)
+    thread.join(timeout=10)
+    reader.close()
+    assert not thread.is_alive()
+
+    def uploaded(message):
+        a, b, ba, bb = message
+        gref = GPURef.pair(engine.ctx, a, b, precision) if a is not None else GPURef(engine.ctx, b, precision)
+        gbla = GPUBla(engine.ctx, bb, precision, bla_a=ba)
+        try:
+            return [buf.read() if buf is not None else None for buf in
+                    (gref.bf, gref.bm, gref.be, gref.bxy, gbla.buf, gbla.qbuf)]
+        finally:
+            gref.release()
+            gbla.release()
+
+    assert uploaded(new) == uploaded(old)
+
+
 def misiurewicz_view(depth10, max_iter=30000, angle=0.3):
     l2 = -depth10 / 0.30103
     p = int(-l2) + 100

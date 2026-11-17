@@ -520,3 +520,203 @@ def test_worker_results_arrive_through_poll_in_order():
     finally:
         w.close()
     assert not w._pump.is_alive()
+
+
+def test_result_pipe_preserves_arrays_and_bounds_wire_chunks():
+    """Large arrays bypass pickle, including shared indices, empty and Fortran arrays."""
+    import multiprocessing as mp
+    import pickle
+    import queue
+    import threading
+    from mandelscope.transfer import CHUNK_BYTES, ResultSender, ResultReceiver
+
+    reader, writer = mp.get_context("spawn").Pipe(duplex=False)
+    sent = []
+
+    class Wire:
+        def send(self, header):
+            assert len(pickle.dumps(header)) < 10_000
+            writer.send(header)
+
+        def send_bytes(self, data):
+            sent.append(len(data))
+            assert len(data) <= CHUNK_BYTES
+            writer.send_bytes(data)
+
+    a = np.arange(CHUNK_BYTES // 4 + 17, dtype=np.float64)
+    arrays = [a, a, np.zeros(0, np.complex128), np.asfortranarray(np.arange(12).reshape(3, 4)),
+              np.array([-0.0, np.inf, -np.inf, np.nan]), np.arange(16)[::2]]
+    tx, rx = ResultSender(Wire()), ResultReceiver(reader)
+    with pytest.raises(queue.Empty):
+        rx.get(timeout=0)
+
+    def send():
+        try:
+            tx.put({"kind": "arrays", "arrays": arrays})
+            a[:] = -1                # the receiver must own a completed snapshot
+            tx.put({"kind": "done"})
+        finally:
+            writer.close()
+
+    thread = threading.Thread(target=send, daemon=True)
+    thread.start()
+    got = rx.get(timeout=5)
+    assert rx.get(timeout=5) == {"kind": "done"}
+    # Windows poll() can detect a closed named pipe before recv() sees EOF.
+    # The worker treats both exceptions as a normal end of the result stream.
+    with pytest.raises((EOFError, BrokenPipeError)):
+        rx.get(timeout=5)
+    thread.join(timeout=5)
+    rx.close()
+    assert not thread.is_alive() and max(sent) == CHUNK_BYTES
+    out = got["arrays"]
+    assert out[0] is out[1] and out[0].flags.aligned and out[0].flags.writeable
+    np.testing.assert_array_equal(out[0], np.arange(len(a)))
+    for original, received in zip(arrays[2:], out[2:]):
+        assert received.dtype == original.dtype and received.shape == original.shape
+        assert received.tobytes() == original.tobytes()  # signed zero / NaN bits included
+
+
+def _terminal_result(worker, jid, parts=None):
+    import time
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        for message in worker.poll():
+            if message["id"] != jid or message["kind"] == "progress":
+                continue
+            if message["kind"] == "partial":
+                if parts is not None:
+                    parts.append(message)
+            else:
+                assert message["kind"] != "error", message
+                return message
+        time.sleep(0.002)
+    raise AssertionError(f"worker job {jid} timed out")
+
+
+def test_worker_pipe_cancellation_streaming_resume_and_bla():
+    """Exercise real spawn/IPC, including immutable partials and the worker's MPFR cache."""
+    from mandelscope.worker import Worker
+    job = dict(re="0", im="1", prec=128, max_iter=100_000, log2_cmax=-60., log2_eps=-24.,
+               stream=True, partial_after=0.)
+    w = Worker()
+    try:
+        # Cancellation is set before the child's first compute check, independent of speed.
+        w.cancel(1)
+        cancelled = w.submit("reference", cancel_previous=False, **job)
+        assert _terminal_result(w, cancelled)["kind"] == "cancelled"
+        jid = w.submit("reference", cancel_previous=False, **job)
+        parts = []
+        final = _terminal_result(w, jid, parts)
+        ref = final["ref"]
+        assert ref.state is None and final["resumable"] and ref.resumed_from == 8193
+        assert parts and all(p["ref"].length < ref.length for p in parts)
+        direct = compute_reference("0", "1", 128, job["max_iter"])
+        for key in ("zf", "zm", "ze"):
+            assert getattr(ref, key).tobytes() == getattr(direct, key).tobytes()
+            for part in parts:
+                r = part["ref"]
+                assert r.state is None
+                assert getattr(r, key).tobytes() == getattr(ref, key)[:r.length].tobytes()
+                assert part["bla"].signature == r.la.signature
+        jid2 = w.submit("bla", ref_id=jid, log2_cmax=-58., log2_eps=-24.)
+        bla = w.wait(jid2, timeout=30)["bla"]
+        assert bla.ref_id == jid and bla.signature == ref.la.signature
+        assert bla.first.tobytes() == ref.la.first.tobytes()
+        jid3 = w.submit("reference", re="0", im="1", prec=128, max_iter=120_000, resume_id=jid)
+        resumed = w.wait(jid3, timeout=30)["ref"]
+        assert resumed.resumed_from == ref.length and resumed.state is None
+    finally:
+        w.close()
+        w.close()                    # shutdown is idempotent
+    assert not w.proc.is_alive() and not w._pump.is_alive()
+    # Keeping results (or just one of their views) across close requires no shared-memory owner.
+    assert resumed.zf[:ref.length].tobytes() == ref.zf.tobytes()
+    assert ref.zm[1] == direct.zm[1]
+
+
+def test_worker_pipe_julia_pair_ship_and_error():
+    from mandelscope.offline import compute_julia_references
+    from mandelscope.worker import Worker
+    job = dict(c_re="0", c_im="1", re="0", im="0", prec=128, max_iter=10000, log2_eps=-24.)
+    expected = compute_julia_references(job, job["log2_eps"])
+    w = Worker()
+    try:
+        for _ in range(2):           # the second request reuses the cached critical orbit
+            jid = w.submit("julia_reference", **job)
+            got = w.wait(jid, timeout=30)
+            assert got["kind"] == "julia_reference" and got["log2_eps"] == job["log2_eps"]
+            for key, original in zip(("ref_a", "ref_b", "bla_a", "bla_b"), expected):
+                obj = got[key]
+                for name, value in vars(original).items():
+                    if isinstance(value, np.ndarray):
+                        assert value.dtype == getattr(obj, name).dtype
+                        assert value.tobytes() == getattr(obj, name).tobytes(), (key, name)
+            assert got["ref_a"].state is None and got["ref_b"].state is None
+            assert got["ref_a"].z0 == (job["re"], job["im"])
+        jid = w.submit("reference", re="-1.8", im="-0.02", prec=128, max_iter=1000, formula="ship")
+        ship = w.wait(jid, timeout=30)["ref"]
+        direct = compute_reference("-1.8", "-0.02", 128, 1000, formula="ship")
+        for key in ("zf", "zm", "ze", "xym", "xye"):
+            assert getattr(ship, key).tobytes() == getattr(direct, key).tobytes()
+        assert w.wait(w.submit("unknown"), timeout=10)["kind"] == "error"
+    finally:
+        w.close()
+
+
+def _worker_dies_mid_result(req_q, sender, cancel_val):
+    import os
+    import pickle
+    import time
+    from mandelscope.transfer import CHUNK_BYTES
+    job = req_q.get()
+    # A valid header followed by only the first of several expected chunks.
+    buffers = []
+    metadata = pickle.dumps(np.zeros(CHUNK_BYTES * 2, dtype=np.uint8), protocol=5,
+                            buffer_callback=buffers.append)
+    sender.connection.send((metadata, [CHUNK_BYTES * 2]))
+    sender.connection.send_bytes(buffers[0].raw()[:CHUNK_BYTES])
+    if job["kind"] == "stall":
+        cancel_val.value = -1         # tell the test that reception has started
+        time.sleep(30)               # ignore cancellation; close() must terminate us
+    os._exit(0)
+
+
+def test_worker_pipe_eof_during_transfer_stops_receiver(monkeypatch):
+    import mandelscope.worker as worker
+    monkeypatch.setattr(worker, "_worker_main", _worker_dies_mid_result)
+    w = worker.Worker()
+    try:
+        w.submit("reference")
+        w.proc.join(timeout=15)
+        w._pump.join(timeout=5)
+        assert not w.proc.is_alive() and not w._pump.is_alive()
+        assert w.poll() == []         # no incomplete result can reach the UI
+    finally:
+        w.close()
+
+
+def test_worker_pipe_close_during_computation():
+    from mandelscope.worker import Worker
+    w = Worker()
+    w.submit("reference", re="0", im="1", prec=128, max_iter=3_000_000, stream=True, partial_after=0.)
+    w.close()
+    assert not w.proc.is_alive() and not w._pump.is_alive()
+
+
+def test_worker_pipe_close_during_incomplete_transfer(monkeypatch):
+    import time
+    import mandelscope.worker as worker
+    monkeypatch.setattr(worker, "_worker_main", _worker_dies_mid_result)
+    w = worker.Worker()
+    try:
+        w.submit("stall")
+        deadline = time.monotonic() + 15
+        while w.cancel_val.value != -1:
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+        w.close()                    # terminate path must unblock the pipe reader
+        assert not w.proc.is_alive() and not w._pump.is_alive()
+        assert w.poll() == []
+    finally:
+        w.close()
